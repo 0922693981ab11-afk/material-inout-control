@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>工程材料管制系統 - 卓越旗艦版</title>
+    <title>工程材料管制系統 - 企業旗艦版</title>
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- Lucide Icons -->
@@ -19,18 +19,18 @@
         const app = initializeApp(firebaseConfig);
         const auth = getAuth(app);
         const db = getFirestore(app);
-        const appId = window.__app_id || 'material-hub-ultimate-v24';
+        const appId = window.__app_id || 'material-hub-enterprise-v1';
 
-        // --- 2. 範本數據 ---
+        // --- 2. 標準物料主檔 (Master Data) ---
         const MASTER_SAMPLES = [
-            { name: "預拌混凝土 4000psi", model: "HFC-4000", unit: "m3", category: "結構工程", spec: "符合 CNS 3036" },
-            { name: "竹節鋼筋 #4 (D13)", model: "SD420W", unit: "ton", category: "結構工程", spec: "熱軋鋼筋" },
-            { name: "PVC 電線管 1\"", model: "E-PIPE", unit: "支", category: "水電工程", spec: "南亞牌" },
-            { name: "自動撒水頭 68度", model: "SP-68", unit: "個", category: "消防工程", spec: "感熱型" },
-            { name: "ABC乾粉滅火器10型", model: "ABC-10型", unit: "具", category: "消防設備", spec: "附標示牌" }
+            { name: "預拌混凝土 4000psi", model: "HFC-4000", spec: "符合 CNS 3036 規範", unit: "m3", category: "結構工程" },
+            { name: "竹節鋼筋 #4 (D13)", model: "SD420W", spec: "熱軋竹節鋼筋", unit: "ton", category: "結構工程" },
+            { name: "PVC 電線管 1\"", model: "E-PIPE", spec: "南亞牌 厚管", unit: "支", category: "水電工程" },
+            { name: "自動撒水頭 68度", model: "SP-68", spec: "感熱型撒水頭", unit: "個", category: "消防工程" },
+            { name: "ABC乾粉滅火器 10型", model: "ABC-10", spec: "附原廠掛勾與標示牌", unit: "具", category: "消防設備" }
         ];
 
-        // --- 3. 全域狀態管理中心 ---
+        // --- 3. 全域狀態與 ERP 邏輯 ---
         window.App = {
             state: {
                 user: null,
@@ -49,6 +49,13 @@
             },
 
             n: (v) => Number(v || 0),
+
+            generateVoucherNo: function(type) {
+                const prefix = type === '出貨' ? 'REQ' : 'RCV'; // Requisition vs Receiving
+                const datePart = new Date().toISOString().split('T')[0].replace(/-/g, '');
+                const randomPart = Math.floor(1000 + Math.random() * 9000);
+                return `${prefix}-${datePart}-${randomPart}`;
+            },
 
             init: async function() {
                 try {
@@ -69,27 +76,29 @@
                         }
                     });
                 } catch (e) {
-                    this.showToast("系統初始化失敗", "error");
+                    this.showToast("資料庫連線失敗，請聯繫系統管理員", "error");
                 }
             },
 
-            // --- 雲端數據同步 ---
             initGlobalSync: function() {
                 onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'projects'), s => {
-                    this.state.projects = s.docs.map(d => ({ id: d.id, ...d.data() }));
+                    this.state.projects = s.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt));
                     this.render();
                 });
                 onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'master_materials'), s => {
                     this.state.masterMaterials = s.docs.map(d => ({ id: d.id, ...d.data() }));
                     this.render();
                 });
+
                 const statsRef = doc(db, 'artifacts', appId, 'public', 'data', 'stats', 'global');
                 onSnapshot(statsRef, d => {
                     if (d.exists()) {
                         this.state.globalUserCount = d.data().userCount || 0;
-                        document.getElementById('global-count').innerText = this.state.globalUserCount;
+                        const countEl = document.getElementById('global-count');
+                        if(countEl) countEl.innerText = this.state.globalUserCount;
                     }
                 });
+
                 runTransaction(db, async (t) => {
                     const d = await t.get(statsRef);
                     if (!d.exists()) t.set(statsRef, { userCount: 1 });
@@ -103,12 +112,11 @@
                     this.render();
                 });
                 onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'logs'), s => {
-                    this.state.logs = s.docs.map(d => ({ id: d.id, ...d.data() })).filter(l => l.projectId === projId).sort((a,b) => new Date(b.date) - new Date(a.date));
+                    this.state.logs = s.docs.map(d => ({ id: d.id, ...d.data() })).filter(l => l.projectId === projId).sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt));
                     this.render();
                 });
             },
 
-            // --- 控制器 ---
             switchTab: function(tab) {
                 this.state.activeTab = tab;
                 this.state.editingId = null;
@@ -132,27 +140,26 @@
                 this.renderListOnly();
             },
 
-            // --- 專案操作 ---
             openCreateModal: () => document.getElementById('modal-create-project').classList.remove('hidden'),
             closeCreateModal: () => document.getElementById('modal-create-project').classList.add('hidden'),
 
             createProject: async function() {
                 const name = document.getElementById('new-proj-name').value;
                 const conNo = document.getElementById('new-proj-no').value;
-                if (!name || !conNo) return this.showToast("請填寫完整資訊", "error");
+                if (!name || !conNo) return this.showToast("專案名稱與代號為必填", "error");
                 const id = `proj_${Date.now()}`;
                 await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'projects', id), {
                     id, name, contractNo: conNo, owner: this.state.user.uid, createdAt: new Date().toISOString()
                 });
                 this.closeCreateModal();
-                this.showToast("新工程已發起");
+                this.showToast("新專案已建檔");
             },
 
             createSampleProject: async function() {
-                if(!confirm('載入「高雄三井Lalaport新建工程」範本？')) return;
+                if(!confirm('系統將載入標準示範專案，是否繼續？')) return;
                 const id = `proj_sample_${Date.now()}`;
                 await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'projects', id), {
-                    id, name: "範例：高雄三井Lalaport新建工程", contractNo: "CON-YT-2026", owner: this.state.user.uid, createdAt: new Date().toISOString()
+                    id, name: "示範專案：高雄三井 Lalaport 新建工程", contractNo: "PRJ-2026-YT01", owner: this.state.user.uid, createdAt: new Date().toISOString()
                 });
                 const batch = writeBatch(db);
                 MASTER_SAMPLES.forEach(m => {
@@ -161,12 +168,12 @@
                 });
                 await batch.commit();
                 this.enterProject(id);
-                this.showToast("範本數據載入成功");
+                this.showToast("範本專案已備妥");
             },
 
             saveAsProject: async function() {
-                const newName = prompt("請輸入新專案名稱：", `${this.state.currentProject.name} (副本)`);
-                const newNo = prompt("請輸入新合約編號：", `${this.state.currentProject.contractNo}-COPY`);
+                const newName = prompt("輸入複製專案名稱：", `${this.state.currentProject.name} (複製)`);
+                const newNo = prompt("輸入新專案代號：", `${this.state.currentProject.contractNo}-COPY`);
                 if (!newName || !newNo) return;
                 const newId = `proj_${Date.now()}`;
                 await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'projects', newId), {
@@ -179,23 +186,21 @@
                     batch.set(doc(db, 'artifacts', appId, 'public', 'data', 'materials', matId), { ...data, projectId: newId });
                 });
                 await batch.commit();
-                this.showToast("專案架構複製完成");
+                this.showToast("BOM 表架構已複製");
                 this.switchTab('project_select');
             },
 
             deleteDoc: async function(col, id, msg) {
                 if (confirm(msg)) {
                     await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', col, id));
-                    this.showToast("數據已刪除");
-                    if (col === 'projects' && this.state.currentProject?.id === id) location.reload();
+                    this.showToast("資料已移除");
                 }
             },
 
-            // --- 材料編輯 ---
             startEdit: function(type, id, data) {
                 this.state.editingId = id;
                 this.state.isAddingNew = id === 'new';
-                this.state.editFormData = data || { category: '一般', contractQty: 0, safetyStock: 0 };
+                this.state.editFormData = data || { category: '一般耗材', contractQty: 0, safetyStock: 0, unit: 'EA' };
                 this.render();
             },
 
@@ -212,9 +217,9 @@
 
             saveMaterial: async function(isMaster) {
                 const d = this.state.editFormData;
-                if (!d.name) return this.showToast("品名為必填", "error");
+                if (!d.name) return this.showToast("物料名稱必填", "error");
                 const col = isMaster ? 'master_materials' : 'materials';
-                const prefix = isMaster ? 'master_' : 'mat_';
+                const prefix = isMaster ? 'sku_' : 'bom_';
                 const finalId = (this.state.editingId && this.state.editingId !== 'new') ? this.state.editingId : `${prefix}${Date.now()}`;
                 const payload = { ...d };
                 if (isMaster) payload.updatedBy = this.state.user.uid;
@@ -225,10 +230,9 @@
                 }
                 await setDoc(doc(db, 'artifacts', appId, 'public', 'data', col, finalId), payload, { merge: true });
                 this.cancelEdit();
-                this.showToast("儲存成功");
+                this.showToast("存檔成功");
             },
 
-            // --- 批次導入 ---
             openBatchImport: function() {
                 this.state.selectedImportIds = [];
                 document.getElementById('modal-import').classList.remove('hidden');
@@ -248,20 +252,20 @@
                 this.state.selectedImportIds.forEach(id => {
                     const item = this.state.masterMaterials.find(m => m.id === id);
                     if (item) {
-                        const matId = `mat_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+                        const matId = `bom_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
                         batch.set(doc(db, 'artifacts', appId, 'public', 'data', 'materials', matId), {
                             projectId: this.state.currentProject.id, 
-                            name: item.name, spec: item.spec || "", model: item.model || "", unit: item.unit || "具", category: item.category || "一般",
+                            name: item.name, spec: item.spec || "", model: item.model || "", unit: item.unit || "EA", category: item.category || "未分類",
                             contractQty: 0, safetyStock: 0
                         });
                     }
                 });
                 await batch.commit();
                 document.getElementById('modal-import').classList.add('hidden');
-                this.showToast(`成功導入 ${this.state.selectedImportIds.length} 項材料`);
+                this.showToast(`成功匯入 ${this.state.selectedImportIds.length} 筆 SKU`);
             },
 
-            // --- 領料表單邏輯 ---
+            // --- 異動單據處理 ---
             handleFormInput: function() {
                 const matId = document.getElementById('f-mat').value;
                 const qty = this.n(document.getElementById('f-qty').value);
@@ -275,13 +279,18 @@
                     document.getElementById('f-current-stock').innerText = `${proc.stock} ${proc.unit}`;
                     
                     if (type === '出貨') {
-                        const totalOut = proc.totalOut;
-                        const isOver = (totalOut + qty) > this.n(mat.contractQty);
+                        const isOver = (proc.totalOut + qty) > this.n(mat.contractQty);
                         const w = document.getElementById('overload-warning');
-                        if (isOver) w.classList.remove('hidden');
-                        else w.classList.add('hidden');
+                        if (isOver) {
+                            w.classList.remove('hidden');
+                            document.getElementById('f-reason').required = true;
+                        } else {
+                            w.classList.add('hidden');
+                            document.getElementById('f-reason').required = false;
+                        }
                     } else {
                         document.getElementById('overload-warning').classList.add('hidden');
+                        document.getElementById('f-reason').required = false;
                     }
                 } else {
                     stockDisplay.classList.add('hidden');
@@ -296,40 +305,45 @@
                 const note = document.getElementById('f-note').value;
                 const reason = document.getElementById('f-reason')?.value || "";
 
-                if (!matId || qty <= 0) return this.showToast("請選擇材料與填寫正確數量", "error");
+                if (!matId || qty <= 0) return this.showToast("參數錯誤", "error");
 
                 if (type === '出貨') {
                     const proc = this.getProcessedMaterials().find(x => x.id === matId);
-                    if (qty > proc.stock) return this.showToast("領料失敗：在庫量不足", "error");
+                    if (qty > proc.stock) return this.showToast(`發料阻斷：當前可用庫存僅剩 ${proc.stock} ${proc.unit}`, "error");
                 }
 
+                const voucherNo = this.generateVoucherNo(type);
                 await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'logs'), {
-                    projectId: this.state.currentProject.id, materialId: matId, qty, type,
+                    projectId: this.state.currentProject.id, 
+                    materialId: matId, 
+                    qty, 
+                    type,
+                    voucherNo,
                     date: document.getElementById('f-date').value,
-                    note: note + (reason ? ` [超領原因: ${reason}]` : ""),
+                    note: note + (reason ? ` [核准超領: ${reason}]` : ""),
                     user: this.state.user.uid,
                     createdAt: new Date().toISOString()
                 });
-                this.showToast("異動紀錄同步成功");
+                
+                this.showToast(`單據 ${voucherNo} 處理完畢`);
                 this.switchTab('logs');
             },
 
             exportCSV: function() {
                 if (!this.state.currentProject) return;
-                const h = ["日期", "單別", "屬性", "品名", "規格", "型號", "數量", "單位", "操作人員", "備註"];
+                const h = ["單據編號", "作業日期", "異動類型", "物料分類", "物料名稱", "型號", "規格", "異動數量", "單位", "作業人員", "稽核備註"];
                 const r = this.state.logs.map(l => {
                     const m = this.state.materials.find(mat => String(mat.id) === String(l.materialId));
-                    return [l.date, l.type, m?.category || "", m?.name || "已刪除", m?.spec || "", m?.model || "", l.qty, m?.unit || "", l.user.slice(-6), l.note];
+                    return [l.voucherNo || "無", l.date, l.type, m?.category || "", m?.name || "[物料已刪除]", m?.model || "", m?.spec || "", l.qty, m?.unit || "", l.user.slice(-6), l.note];
                 });
                 const content = "\uFEFF" + [h, ...r].map(e => e.join(",")).join("\n");
                 const blob = new Blob([content], { type: 'text/csv;charset=utf-8;' });
                 const link = document.createElement("a");
                 link.href = URL.createObjectURL(blob);
-                link.download = `工程材料單_${this.state.currentProject.contractNo}.csv`;
+                link.download = `${this.state.currentProject.contractNo}_庫存異動明細_${new Date().toISOString().split('T')[0]}.csv`;
                 link.click();
             },
 
-            // --- 計算屬性 ---
             getProcessedMaterials: function() {
                 return this.state.materials.map(m => {
                     const mLogs = this.state.logs.filter(l => String(l.materialId) === String(m.id));
@@ -344,21 +358,22 @@
                 });
             },
 
-            // --- 渲染部分 ---
+            // --- 視圖渲染 ---
             renderSidebar: function() {
                 document.querySelectorAll('.nav-btn').forEach(b => {
-                    b.classList.remove('bg-blue-600', 'text-white', 'shadow-xl');
-                    b.classList.add('text-slate-400', 'hover:bg-slate-800');
+                    b.classList.remove('bg-indigo-600', 'text-white', 'shadow-md', 'font-bold');
+                    b.classList.add('text-slate-400', 'hover:bg-slate-800', 'font-medium');
                 });
                 const activeBtn = document.getElementById(`nav-${this.state.activeTab}`);
                 if (activeBtn) {
-                    activeBtn.classList.add('bg-blue-600', 'text-white', 'shadow-xl');
-                    activeBtn.classList.remove('text-slate-400', 'hover:bg-slate-800');
+                    activeBtn.classList.add('bg-indigo-600', 'text-white', 'shadow-md', 'font-bold');
+                    activeBtn.classList.remove('text-slate-400', 'hover:bg-slate-800', 'font-medium');
                 }
                 const pInfo = document.getElementById('sidebar-project-info');
                 if (this.state.currentProject) {
                     pInfo.classList.remove('hidden');
-                    document.getElementById('sidebar-project-name').innerText = this.state.currentProject.name;
+                    document.getElementById('sidebar-project-name').innerText = this.state.currentProject.contractNo;
+                    document.getElementById('sidebar-project-desc').innerText = this.state.currentProject.name;
                 } else pInfo.classList.add('hidden');
             },
 
@@ -369,51 +384,80 @@
                 
                 let headerHtml = '';
                 if (tab === 'project_select') {
-                    headerHtml = `<div class="flex justify-between items-start mb-10 gap-8">
-                                    <div><h2 class="text-6xl font-black text-slate-900 tracking-tighter italic">開案中心</h2>
-                                    <span class="px-3 py-1 bg-white border rounded-full text-[10px] font-black uppercase text-slate-500 shadow-sm flex items-center gap-2 mt-4 italic"><i data-lucide="globe" size="12"></i> 雲端同步系統 (吳啓仲開發)</span></div>
-                                    <div class="flex gap-4">
-                                        <button onclick="App.createSampleProject()" class="bg-amber-500 text-white px-8 py-4 rounded-3xl font-black shadow-xl hover:bg-amber-600 transition flex items-center gap-2 text-sm italic"><i data-lucide="sparkles"></i> 載入範本專案</button>
-                                        <button onclick="App.openCreateModal()" class="bg-blue-600 text-white px-10 py-4 rounded-3xl font-black shadow-2xl hover:bg-blue-700 transition flex items-center gap-3 italic uppercase text-sm font-mono tracking-widest"><i data-lucide="folder-plus"></i> NEW_PROJECT</button>
-                                    </div>
-                                  </div>
-                                  <div class="mb-10 relative">
-                                    <i data-lucide="search" class="absolute left-6 top-1/2 -translate-y-1/2 text-slate-300" size="24"></i>
-                                    <input type="text" oninput="App.setSearchTerm(this.value)" value="${this.state.searchTerm}" placeholder="快速搜尋專案..." class="w-full pl-16 pr-8 py-6 bg-white border-2 border-slate-50 rounded-[2.5rem] text-xl font-bold shadow-sm focus:border-blue-500 outline-none">
-                                  </div>`;
+                    headerHtml = `
+                        <div class="flex justify-between items-end mb-8">
+                            <div>
+                                <h2 class="text-3xl font-black text-slate-800 tracking-tight">專案樞紐中心 (Project Hub)</h2>
+                                <p class="text-sm text-slate-500 mt-2 font-medium">管理所有工程專案與合約配置</p>
+                            </div>
+                            <div class="flex gap-3">
+                                <button onclick="App.createSampleProject()" class="bg-white border border-slate-300 text-slate-600 px-5 py-2.5 rounded-lg text-sm font-semibold shadow-sm hover:bg-slate-50 transition flex items-center gap-2"><i data-lucide="package-open" size="16"></i> 載入示範專案</button>
+                                <button onclick="App.openCreateModal()" class="bg-indigo-600 text-white px-5 py-2.5 rounded-lg text-sm font-semibold shadow-sm hover:bg-indigo-700 transition flex items-center gap-2"><i data-lucide="folder-plus" size="16"></i> 立項建檔</button>
+                            </div>
+                        </div>
+                        <div class="mb-8 relative max-w-md">
+                            <i data-lucide="search" class="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400" size="18"></i>
+                            <input type="text" oninput="App.setSearchTerm(this.value)" value="${this.state.searchTerm}" placeholder="檢索專案代號或名稱..." class="w-full pl-11 pr-4 py-2.5 bg-white border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all">
+                        </div>`;
                 } else if (tab === 'master_library') {
-                    headerHtml = `<div class="flex justify-between items-center mb-10">
-                                    <div><h2 class="text-4xl font-black text-slate-900 tracking-tighter italic uppercase font-mono tracking-tight">Master_Library</h2>
-                                    <p class="text-slate-400 font-bold uppercase text-[10px] tracking-widest font-mono">Global Materials Hub</p></div>
-                                    ${!this.state.isAddingNew ? `<div class="flex gap-4">
-                                        <button onclick="App.seedMasterLibrary()" class="bg-white border-2 border-slate-200 text-slate-600 px-6 py-3 rounded-2xl font-black hover:bg-slate-50 transition shadow-sm text-sm italic tracking-widest uppercase">Seed_Data</button>
-                                        <button onclick="App.startEdit('master', 'new')" class="bg-slate-900 text-white px-8 py-3 rounded-2xl font-black shadow-xl hover:bg-slate-800 transition active:scale-95 flex items-center gap-2 italic uppercase text-sm"><i data-lucide="plus"></i> Add_Standard</button>
-                                    </div>` : ''}
-                                  </div>`;
+                    headerHtml = `
+                        <div class="flex justify-between items-end mb-8">
+                            <div>
+                                <h2 class="text-3xl font-black text-slate-800 tracking-tight">標準物料主檔 (Master Data)</h2>
+                                <p class="text-sm text-slate-500 mt-2 font-medium">企業級全域 SKU 基礎數據庫</p>
+                            </div>
+                            ${!this.state.isAddingNew ? `
+                            <div class="flex gap-3">
+                                <button onclick="App.seedMasterLibrary()" class="bg-white border border-slate-300 text-slate-600 px-5 py-2.5 rounded-lg text-sm font-semibold shadow-sm hover:bg-slate-50 transition flex items-center gap-2"><i data-lucide="download-cloud" size="16"></i> 載入內建主檔</button>
+                                <button onclick="App.startEdit('master', 'new')" class="bg-slate-800 text-white px-5 py-2.5 rounded-lg text-sm font-semibold shadow-sm hover:bg-slate-900 transition flex items-center gap-2"><i data-lucide="plus-circle" size="16"></i> 新增 SKU</button>
+                            </div>` : ''}
+                        </div>
+                        ${!this.state.isAddingNew ? `
+                        <div class="mb-6 relative max-w-md">
+                            <i data-lucide="search" class="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400" size="18"></i>
+                            <input type="text" oninput="App.setSearchTerm(this.value)" value="${this.state.searchTerm}" placeholder="檢索物料名稱、型號或規格..." class="w-full pl-11 pr-4 py-2 bg-white border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 outline-none transition-all">
+                        </div>` : ''}`;
                 } else if (tab === 'dashboard') {
-                    headerHtml = `<div class="flex justify-between items-end border-b border-slate-100 pb-8 mb-8">
-                                    <div><h2 class="text-4xl font-black text-slate-900 tracking-tighter mb-2 italic underline decoration-blue-500 decoration-8 underline-offset-8">${this.state.currentProject.name}</h2>
-                                    <p class="text-slate-400 font-bold uppercase tracking-widest text-[10px] font-mono italic">CONTRACT_NO: ${this.state.currentProject.contractNo}</p></div>
-                                    <button onclick="App.saveAsProject()" class="bg-white border-2 border-slate-200 text-slate-600 px-5 py-2.5 rounded-2xl text-xs font-black hover:bg-slate-50 transition shadow-sm flex items-center gap-2 italic"><i data-lucide="copy" size="14"></i> 複製專案副本</button>
-                                  </div>`;
+                    headerHtml = `
+                        <div class="flex justify-between items-center bg-white p-6 rounded-2xl shadow-sm border border-slate-100 mb-8">
+                            <div>
+                                <h2 class="text-2xl font-bold text-slate-800">${this.state.currentProject.name}</h2>
+                                <div class="flex items-center gap-3 mt-1">
+                                    <span class="bg-indigo-50 text-indigo-700 px-2 py-0.5 rounded text-xs font-mono font-bold border border-indigo-100">${this.state.currentProject.contractNo}</span>
+                                    <span class="text-xs text-slate-500 font-medium flex items-center gap-1"><i data-lucide="calendar" size="12"></i> 立項日期: ${this.state.currentProject.createdAt.split('T')[0]}</span>
+                                </div>
+                            </div>
+                            <button onclick="App.saveAsProject()" class="text-slate-600 bg-slate-50 border border-slate-200 px-4 py-2 rounded-lg text-sm font-semibold hover:bg-slate-100 transition flex items-center gap-2"><i data-lucide="copy" size="16"></i> 複製專案 BOM</button>
+                        </div>`;
                 } else if (tab === 'inventory') {
-                    headerHtml = `<div class="flex justify-between items-center mb-10">
-                                    <div><h2 class="text-4xl font-black text-slate-900 tracking-tighter italic">合約細項與庫存</h2>
-                                    <p class="text-slate-400 font-bold uppercase text-[10px] tracking-widest font-mono">Contract Items Monitor</p></div>
-                                    <div class="flex gap-4">
-                                        <button onclick="App.openBatchImport()" class="bg-white border-2 border-slate-200 text-blue-600 px-6 py-3 rounded-2xl font-black hover:bg-blue-50 transition shadow-sm flex items-center gap-2 text-sm italic tracking-widest uppercase"><i data-lucide="database" size="18"></i> Import_Master</button>
-                                        <button onclick="App.startEdit('material', 'new')" class="bg-slate-900 text-white px-8 py-3 rounded-2xl font-black shadow-xl hover:bg-slate-800 transition text-sm flex items-center gap-2 italic uppercase tracking-widest font-mono"><i data-lucide="plus" size="18"></i> Manual_Entry</button>
-                                    </div>
-                                  </div>`;
+                    headerHtml = `
+                        <div class="flex justify-between items-end mb-8">
+                            <div>
+                                <h2 class="text-3xl font-black text-slate-800 tracking-tight">專案合約 BOM 表 (Contract BOM)</h2>
+                                <p class="text-sm text-slate-500 mt-2 font-medium">配置專案所需物料清單與預算額度</p>
+                            </div>
+                            <div class="flex gap-3">
+                                <button onclick="App.openBatchImport()" class="bg-white border border-slate-300 text-indigo-600 px-5 py-2.5 rounded-lg text-sm font-semibold shadow-sm hover:bg-indigo-50 transition flex items-center gap-2"><i data-lucide="import" size="16"></i> 自主檔匯入</button>
+                                <button onclick="App.startEdit('material', 'new')" class="bg-slate-800 text-white px-5 py-2.5 rounded-lg text-sm font-semibold shadow-sm hover:bg-slate-900 transition flex items-center gap-2"><i data-lucide="plus" size="16"></i> 專案特規料件</button>
+                            </div>
+                        </div>
+                        ${!this.state.isAddingNew ? `
+                        <div class="mb-6 relative max-w-md">
+                            <i data-lucide="search" class="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400" size="18"></i>
+                            <input type="text" oninput="App.setSearchTerm(this.value)" value="${this.state.searchTerm}" placeholder="篩選 BOM 內容..." class="w-full pl-11 pr-4 py-2 bg-white border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 outline-none transition-all">
+                        </div>` : ''}`;
                 } else if (tab === 'logs') {
-                    headerHtml = `<div class="flex justify-between items-center bg-white p-10 rounded-[3rem] border border-slate-100 shadow-sm mb-10">
-                                    <div><h2 class="text-3xl font-black text-slate-900 tracking-tighter italic uppercase font-mono tracking-tight underline decoration-blue-500 decoration-4">History_Logs</h2>
-                                    <p class="text-slate-400 font-bold uppercase tracking-widest text-[10px] font-mono mt-1 italic">Real-time Transaction Feed</p></div>
-                                    <button onclick="App.exportCSV()" class="bg-slate-900 text-white px-8 py-4 rounded-2xl hover:bg-slate-800 transition shadow-xl active:scale-95 flex items-center gap-3 font-black text-sm italic font-mono uppercase tracking-widest"><i data-lucide="download" size="18"></i> Export_CSV</button>
-                                  </div>`;
+                    headerHtml = `
+                        <div class="flex justify-between items-end mb-8">
+                            <div>
+                                <h2 class="text-3xl font-black text-slate-800 tracking-tight">稽核日誌 (Audit Trail)</h2>
+                                <p class="text-sm text-slate-500 mt-2 font-medium">所有庫存異動之不可竄改紀錄</p>
+                            </div>
+                            <button onclick="App.exportCSV()" class="bg-green-600 text-white px-5 py-2.5 rounded-lg text-sm font-semibold shadow-sm hover:bg-green-700 transition flex items-center gap-2"><i data-lucide="file-spreadsheet" size="16"></i> 匯出報表 (CSV)</button>
+                        </div>`;
                 }
 
-                main.innerHTML = `<div class="p-8 md:p-16 max-w-7xl mx-auto animate-in fade-in">${headerHtml}<div id="list-container"></div></div>`;
+                main.innerHTML = `<div class="p-8 max-w-[1400px] mx-auto animate-in fade-in">${headerHtml}<div id="list-container"></div></div>`;
                 this.renderListOnly();
                 lucide.createIcons();
             },
@@ -427,54 +471,56 @@
 
                 if (tab === 'project_select') {
                     const filtered = this.state.projects.filter(p => p.name.toLowerCase().includes(term) || p.contractNo.toLowerCase().includes(term));
-                    html = `<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+                    html = `<div class="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-4 gap-6">
                                 ${filtered.map(p => `
-                                    <div onclick="App.enterProject('${p.id}')" class="group bg-white p-10 rounded-[4.5rem] border-2 border-transparent hover:border-blue-500 cursor-pointer transition-all shadow-sm hover:shadow-2xl flex flex-col h-[320px]">
-                                        <div class="flex justify-between items-start mb-8">
-                                            <div class="w-16 h-16 bg-slate-50 rounded-2xl flex items-center justify-center group-hover:bg-blue-50 transition"><i data-lucide="briefcase" class="text-slate-300 group-hover:text-blue-600" size="32"></i></div>
-                                            <span class="text-[10px] font-black bg-slate-100 text-slate-500 px-3 py-1.5 rounded-xl uppercase tracking-widest font-mono italic">${p.contractNo}</span>
+                                    <div onclick="App.enterProject('${p.id}')" class="bg-white p-6 rounded-2xl border border-slate-200 hover:border-indigo-500 cursor-pointer transition-all shadow-sm hover:shadow-md flex flex-col group h-48">
+                                        <div class="flex justify-between items-start mb-4">
+                                            <div class="bg-indigo-50 p-3 rounded-lg text-indigo-600 group-hover:bg-indigo-600 group-hover:text-white transition-colors"><i data-lucide="folder" size="24"></i></div>
+                                            <button onclick="event.stopPropagation(); App.deleteDoc('projects', '${p.id}', '將永久刪除專案與所有關聯單據，確認執行？')" class="text-slate-300 hover:text-red-500 transition"><i data-lucide="trash-2" size="16"></i></button>
                                         </div>
-                                        <h3 class="text-2xl font-black text-slate-800 mb-3 leading-tight group-hover:text-blue-600 transition line-clamp-2 italic">${p.name}</h3>
-                                        <div class="mt-auto pt-8 border-t border-slate-50 flex justify-between items-center text-slate-400 text-[10px] font-black uppercase tracking-widest font-mono italic">
-                                            <p>EST. ${p.createdAt?.split('T')[0]}</p>
-                                            <button onclick="event.stopPropagation(); App.deleteDoc('projects', '${p.id}', '確定永久刪除工程資料？')" class="text-slate-200 hover:text-red-500 transition p-2 bg-white rounded-full"><i data-lucide="trash-2" size="18"></i></button>
-                                        </div>
+                                        <div class="font-mono text-xs text-slate-400 font-bold mb-1">${p.contractNo}</div>
+                                        <h3 class="text-lg font-bold text-slate-800 leading-tight line-clamp-2">${p.name}</h3>
+                                        <div class="mt-auto text-xs text-slate-400 font-medium pt-4 border-t border-slate-50">建立於: ${p.createdAt?.split('T')[0]}</div>
                                     </div>
                                 `).join('')}
                             </div>`;
                 } else if (tab === 'master_library') {
-                    const filtered = this.state.masterMaterials.filter(m => m.name.toLowerCase().includes(term) || (m.model||'').toLowerCase().includes(term));
+                    const filtered = this.state.masterMaterials.filter(m => m.name.toLowerCase().includes(term) || (m.model||'').toLowerCase().includes(term) || (m.spec||'').toLowerCase().includes(term));
                     const isEdit = this.state.editingId || this.state.isAddingNew;
                     const d = this.state.editFormData;
-                    html = `<div class="bg-white rounded-[3.5rem] shadow-sm border border-slate-200 overflow-hidden">
-                                <table class="w-full text-left">
-                                    <thead class="bg-slate-50 text-slate-400 font-black border-b uppercase tracking-widest text-[9px] font-mono italic">
-                                        <tr><th class="px-8 py-6">CATEGORY_NAME</th><th class="px-8 py-6">SPECIFICATION</th><th class="px-8 py-6 text-center">UNIT</th><th class="px-8 py-6 text-center">ACTION</th></tr>
+                    
+                    html = `<div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                                <table class="w-full text-left text-sm whitespace-nowrap">
+                                    <thead class="bg-slate-50 text-slate-500 font-semibold border-b border-slate-200">
+                                        <tr><th class="px-6 py-4">物料分類 / 名稱</th><th class="px-6 py-4">型號 (Model)</th><th class="px-6 py-4">規格 (Spec)</th><th class="px-6 py-4 text-center">計量單位</th><th class="px-6 py-4 text-center">操作</th></tr>
                                     </thead>
-                                    <tbody class="divide-y divide-slate-100 text-sm font-bold text-slate-700">
-                                        ${isEdit ? `<tr class="bg-blue-50/50 italic">
-                                            <td class="px-6 py-6 space-y-3">
-                                                <input class="w-full p-4 border-2 border-blue-200 rounded-2xl outline-none text-base" placeholder="品名" value="${d.name||''}" oninput="App.updateEditForm('name', this.value)">
-                                                <input class="w-full p-3 border border-blue-100 rounded-xl text-xs" placeholder="分類" value="${d.category||''}" oninput="App.updateEditForm('category', this.value)">
+                                    <tbody class="divide-y divide-slate-100 text-slate-700">
+                                        ${isEdit ? `
+                                        <tr class="bg-indigo-50/50">
+                                            <td class="px-6 py-4 space-y-2">
+                                                <input class="w-full p-2 border border-indigo-200 rounded outline-none font-bold" placeholder="物料名稱" value="${d.name||''}" oninput="App.updateEditForm('name', this.value)">
+                                                <input class="w-full p-2 border border-indigo-200 rounded text-xs" placeholder="分類 (例: 電氣)" value="${d.category||''}" oninput="App.updateEditForm('category', this.value)">
                                             </td>
-                                            <td class="px-6 py-6 space-y-3">
-                                                <input class="w-full p-3 border border-blue-100 rounded-xl" placeholder="型號" value="${d.model||''}" oninput="App.updateEditForm('model', this.value)">
-                                                <input class="w-full p-3 border border-blue-100 rounded-xl text-xs" placeholder="規格描述" value="${d.spec||''}" oninput="App.updateEditForm('spec', this.value)">
+                                            <td class="px-6 py-4"><input class="w-full p-2 border border-indigo-200 rounded font-mono text-xs" placeholder="型號" value="${d.model||''}" oninput="App.updateEditForm('model', this.value)"></td>
+                                            <td class="px-6 py-4"><input class="w-full p-2 border border-indigo-200 rounded text-xs" placeholder="詳細規格" value="${d.spec||''}" oninput="App.updateEditForm('spec', this.value)"></td>
+                                            <td class="px-6 py-4 text-center"><input class="w-16 mx-auto p-2 border border-indigo-200 rounded text-center text-xs" placeholder="單位" value="${d.unit||'EA'}" oninput="App.updateEditForm('unit', this.value)"></td>
+                                            <td class="px-6 py-4 text-center">
+                                                <div class="flex justify-center gap-2">
+                                                    <button onclick="App.saveMaterial(true)" class="p-2 bg-indigo-600 text-white rounded hover:bg-indigo-700"><i data-lucide="save" size="16"></i></button>
+                                                    <button onclick="App.cancelEdit()" class="p-2 bg-white text-slate-500 rounded border hover:bg-slate-50"><i data-lucide="x" size="16"></i></button>
+                                                </div>
                                             </td>
-                                            <td class="px-6 py-6 text-center"><input class="w-20 mx-auto p-4 border border-blue-100 rounded-2xl text-center" placeholder="單位" value="${d.unit||'具'}" oninput="App.updateEditForm('unit', this.value)"></td>
-                                            <td class="px-6 py-6 text-center"><div class="flex justify-center gap-2">
-                                                <button onclick="App.saveMaterial(true)" class="p-3 bg-blue-600 text-white rounded-xl shadow-lg"><i data-lucide="check" size="18"></i></button>
-                                                <button onclick="App.cancelEdit()" class="p-3 bg-white text-slate-400 rounded-xl border hover:bg-slate-50"><i data-lucide="x" size="18"></i></button>
-                                            </div></td>
                                         </tr>` : ''}
-                                        ${filtered.map(m => `<tr class="hover:bg-slate-50 transition-all group italic">
-                                            <td class="px-8 py-6"><div class="text-base text-slate-900 font-black">${m.name}</div><span class="text-[9px] bg-slate-100 text-slate-400 px-2 py-0.5 rounded uppercase tracking-widest mt-1 inline-block">${m.category||'一般'}</span></td>
-                                            <td class="px-8 py-6"><div class="font-black text-slate-600 uppercase tracking-tight text-xs font-mono">MOD: ${m.model || '--'}</div><div class="text-[10px] text-slate-400 mt-1">${m.spec || ''}</div></td>
-                                            <td class="px-8 py-6 text-center text-slate-400 uppercase font-mono">${m.unit}</td>
-                                            <td class="px-8 py-6 text-center">
-                                                <div class="flex justify-center gap-3 opacity-0 group-hover:opacity-100 transition-all">
-                                                    <button onclick='App.startEdit("master", "${m.id}", ${JSON.stringify(m).replace(/'/g, "&apos;")})' class="text-slate-300 hover:text-blue-600"><i data-lucide="edit-2" size="18"></i></button>
-                                                    <button onclick="App.deleteDoc('master_materials', '${m.id}', '永久移除此標準項目？')" class="text-slate-300 hover:text-red-500"><i data-lucide="trash-2" size="18"></i></button>
+                                        ${filtered.map(m => `
+                                        <tr class="hover:bg-slate-50 transition-colors">
+                                            <td class="px-6 py-4"><div class="font-bold text-slate-800">${m.name}</div><div class="text-xs text-slate-500 mt-1">${m.category||'未分類'}</div></td>
+                                            <td class="px-6 py-4 font-mono text-xs">${m.model || '-'}</td>
+                                            <td class="px-6 py-4 text-xs text-slate-500 truncate max-w-[200px]" title="${m.spec}">${m.spec || '-'}</td>
+                                            <td class="px-6 py-4 text-center font-mono text-xs">${m.unit}</td>
+                                            <td class="px-6 py-4 text-center">
+                                                <div class="flex justify-center gap-3">
+                                                    <button onclick='App.startEdit("master", "${m.id}", ${JSON.stringify(m).replace(/'/g, "&apos;")})' class="text-slate-400 hover:text-indigo-600"><i data-lucide="edit-3" size="16"></i></button>
+                                                    <button onclick="App.deleteDoc('master_materials', '${m.id}', '確認從主檔剔除？')" class="text-slate-400 hover:text-red-500"><i data-lucide="trash-2" size="16"></i></button>
                                                 </div>
                                             </td>
                                         </tr>`).join('')}
@@ -483,111 +529,227 @@
                             </div>`;
                 } else if (tab === 'dashboard') {
                     const proc = this.getProcessedMaterials();
-                    const lowCount = proc.filter(m => m.isLow || m.isEmpty).length;
-                    const overCount = proc.filter(m => m.isOver).length;
+                    const lowStockItems = proc.filter(m => m.isLow || m.isEmpty);
+                    const overItems = proc.filter(m => m.isOver);
                     const avgProgress = proc.length ? Math.round(proc.reduce((s, m) => s + m.progress, 0) / proc.length) : 0;
-                    html = `<div class="grid grid-cols-1 md:grid-cols-4 gap-8 mb-12">
-                                ${[{ l: '合約總項', v: proc.length, c: 'text-slate-800', i: 'layers' },
-                                   { l: '低量/警示', v: lowCount, c: 'text-amber-600', i: 'alert-circle' },
-                                   { l: '超領告警', v: overCount, c: 'text-red-600', i: 'shield-alert' },
-                                   { l: '總執行率', v: avgProgress + '%', c: 'text-blue-600', i: 'trending-up' }
-                                ].map(s => `
-                                    <div class="bg-white p-8 rounded-[3.5rem] shadow-sm border border-slate-50 flex flex-col justify-between h-44 italic tracking-tight">
-                                        <div class="flex justify-between items-start"><p class="text-slate-400 text-[10px] font-black uppercase tracking-widest font-mono italic">${s.l}</p><i data-lucide="${s.i}" class="${s.c}" size="20"></i></div>
-                                        <p class="text-5xl font-black ${s.c} tracking-tighter">${s.v}</p>
-                                    </div>`).join('')}
+                    
+                    html = `<div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
+                                <div class="bg-white p-6 rounded-xl shadow-sm border border-slate-200 border-l-4 border-l-slate-800">
+                                    <p class="text-xs font-semibold text-slate-500 uppercase">監管物料總數 (SKUs)</p>
+                                    <p class="text-3xl font-black text-slate-800 mt-2">${proc.length}</p>
+                                </div>
+                                <div class="bg-white p-6 rounded-xl shadow-sm border border-slate-200 border-l-4 border-l-blue-500">
+                                    <p class="text-xs font-semibold text-slate-500 uppercase">專案撥發進度</p>
+                                    <p class="text-3xl font-black text-blue-600 mt-2">${avgProgress}%</p>
+                                </div>
+                                <div class="bg-white p-6 rounded-xl shadow-sm border border-slate-200 border-l-4 border-l-amber-500">
+                                    <p class="text-xs font-semibold text-slate-500 uppercase">低於安全水位</p>
+                                    <p class="text-3xl font-black text-amber-600 mt-2">${lowStockItems.length}</p>
+                                </div>
+                                <div class="bg-white p-6 rounded-xl shadow-sm border border-slate-200 border-l-4 border-l-red-500">
+                                    <p class="text-xs font-semibold text-slate-500 uppercase">超出合約預算</p>
+                                    <p class="text-3xl font-black text-red-600 mt-2">${overItems.length}</p>
+                                </div>
                             </div>
-                            <div class="bg-white p-12 rounded-[4.5rem] shadow-sm border border-slate-50 italic">
-                                <h3 class="text-2xl font-black text-slate-800 mb-10 flex items-center gap-4 uppercase font-mono tracking-widest italic underline decoration-blue-500 decoration-4">Contract_Progress_TOP6</h3>
-                                <div class="space-y-10">
-                                    ${[...proc].sort((a,b) => b.progress - a.progress).slice(0, 6).map(m => `
-                                        <div class="space-y-4">
-                                            <div class="flex justify-between items-end font-black text-lg">
-                                                <div class="flex flex-col"><span class="text-slate-800">${m.name}</span><span class="text-[10px] text-slate-400 uppercase font-mono">SPEC: ${m.model || '--'}</span></div>
-                                                <span class="${m.isOver ? 'text-red-600 font-mono' : 'text-slate-400 font-mono'} text-sm">OUT: ${m.totalOut} / CONTRACT: ${m.contractQty} ${m.unit}</span>
+                            
+                            <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                                <div class="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+                                    <h3 class="text-sm font-bold text-slate-800 mb-4 flex items-center gap-2"><i data-lucide="alert-triangle" class="text-amber-500" size="16"></i> 庫存警戒與缺料分析</h3>
+                                    <div class="space-y-3">
+                                        ${lowStockItems.length === 0 ? '<p class="text-sm text-slate-400">目前庫存水位健康</p>' : 
+                                          lowStockItems.map(m => `
+                                            <div class="flex justify-between items-center p-3 bg-slate-50 rounded-lg border border-slate-100">
+                                                <div>
+                                                    <p class="text-sm font-bold text-slate-800">${m.name}</p>
+                                                    <p class="text-xs font-mono text-slate-500">安全值: ${m.safetyStock} | 單號: ${m.model || '-'}</p>
+                                                </div>
+                                                <div class="text-right">
+                                                    <p class="text-lg font-black font-mono ${m.isEmpty ? 'text-red-600' : 'text-amber-600'}">${m.stock} <span class="text-xs font-normal">${m.unit}</span></p>
+                                                </div>
                                             </div>
-                                            <div class="w-full h-4 bg-slate-100 rounded-full overflow-hidden shadow-inner p-1 flex"><div class="h-full ${m.isOver ? 'bg-red-500' : 'bg-blue-600'} transition-all duration-1000 rounded-full" style="width: ${m.progress}%"></div></div>
-                                        </div>`).join('')}
+                                        `).join('')}
+                                    </div>
+                                </div>
+                                <div class="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+                                    <h3 class="text-sm font-bold text-slate-800 mb-4 flex items-center gap-2"><i data-lucide="bar-chart-2" class="text-indigo-500" size="16"></i> 合約耗用 TOP 5</h3>
+                                    <div class="space-y-4">
+                                        ${[...proc].sort((a,b) => b.progress - a.progress).slice(0, 5).map(m => `
+                                            <div>
+                                                <div class="flex justify-between text-xs font-bold mb-1">
+                                                    <span class="text-slate-700 truncate w-2/3" title="${m.name}">${m.name}</span>
+                                                    <span class="font-mono ${m.isOver ? 'text-red-600' : 'text-slate-500'}">${m.progress}% (${m.totalOut}/${m.contractQty})</span>
+                                                </div>
+                                                <div class="w-full bg-slate-100 rounded-full h-2">
+                                                    <div class="${m.isOver ? 'bg-red-500' : 'bg-indigo-500'} h-2 rounded-full transition-all" style="width: ${Math.min(m.progress, 100)}%"></div>
+                                                </div>
+                                            </div>
+                                        `).join('')}
+                                    </div>
                                 </div>
                             </div>`;
                 } else if (tab === 'inventory') {
                     const proc = this.getProcessedMaterials().filter(m => m.name.toLowerCase().includes(term) || (m.category||'').toLowerCase().includes(term));
                     const isEdit = this.state.editingId || this.state.isAddingNew;
                     const d = this.state.editFormData;
-                    html = `<div class="bg-white rounded-[3.5rem] shadow-sm border border-slate-200 overflow-hidden italic">
-                                <table class="w-full text-left">
-                                    <thead class="bg-slate-50 text-slate-400 font-black border-b uppercase tracking-widest text-[9px] font-mono">
-                                        <tr><th class="px-8 py-6">ITEM_DESCRIPTION</th><th class="px-8 py-6 text-center">LIMIT</th><th class="px-8 py-6 text-center">IN_OUT</th><th class="px-8 py-6 text-center">STOCK</th><th class="px-8 py-6 text-center">MANAGE</th></tr>
+
+                    html = `<div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                                <table class="w-full text-left text-sm whitespace-nowrap">
+                                    <thead class="bg-slate-50 text-slate-500 font-semibold border-b border-slate-200">
+                                        <tr>
+                                            <th class="px-6 py-4">狀態</th>
+                                            <th class="px-6 py-4">BOM 項目</th>
+                                            <th class="px-6 py-4 text-center">合約額度</th>
+                                            <th class="px-6 py-4 text-center">累計出入庫</th>
+                                            <th class="px-6 py-4 text-center">在手庫存</th>
+                                            <th class="px-6 py-4 text-center">操作</th>
+                                        </tr>
                                     </thead>
-                                    <tbody class="divide-y divide-slate-100 text-sm font-bold text-slate-700">
-                                        ${isEdit ? `<tr class="bg-blue-50/50"><td class="px-6 py-6 space-y-3">
-                                            <input class="w-full p-4 border-2 border-blue-200 rounded-2xl outline-none text-base" placeholder="品名" value="${d.name||''}" oninput="App.updateEditForm('name', this.value)">
-                                            <input class="w-full p-3 border border-blue-100 rounded-xl text-xs" placeholder="規格/型號" value="${d.model||''}" oninput="App.updateEditForm('model', this.value)">
-                                        </td><td class="px-6 py-6 text-center">
-                                            <input type="number" class="w-20 mx-auto p-3 border border-blue-100 rounded-xl text-center" value="${d.contractQty||0}" oninput="App.updateEditForm('contractQty', this.value)">
-                                        </td><td colspan="2" class="px-6 py-6 text-center">
-                                            <input type="number" class="w-24 p-3 border border-amber-200 rounded-xl text-center text-xs" placeholder="安全量" value="${d.safetyStock||0}" oninput="App.updateEditForm('safetyStock', this.value)">
-                                        </td><td class="px-6 py-6 text-center"><div class="flex justify-center gap-2">
-                                            <button onclick="App.saveMaterial(false)" class="p-3 bg-blue-600 text-white rounded-xl shadow-lg"><i data-lucide="check" size="18"></i></button>
-                                            <button onclick="App.cancelEdit()" class="p-3 bg-white text-slate-400 rounded-xl border"><i data-lucide="x" size="18"></i></button>
-                                        </div></td></tr>` : ''}
-                                        ${proc.map(m => `<tr class="hover:bg-slate-50 transition-all group">
-                                            <td class="px-8 py-6"><div class="text-base text-slate-900 font-black">${m.name}</div><div class="text-[10px] text-slate-400 font-mono mt-0.5 uppercase tracking-tighter">SPEC: ${m.model || '--'}</div></td>
-                                            <td class="px-8 py-6 text-center"><span class="text-xl font-black font-mono tracking-tighter">${m.contractQty}</span><span class="text-[9px] text-slate-400 ml-1 uppercase">${m.unit}</span></td>
-                                            <td class="px-8 py-6 text-center flex flex-col items-center gap-1 justify-center h-full mt-4">
-                                                <span class="text-[9px] font-black text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded uppercase font-mono tracking-widest">IN: ${m.totalIn}</span>
-                                                <span class="text-[9px] font-black ${m.isOver?'bg-red-50 text-red-600':'text-orange-600 bg-orange-50'} px-2 py-0.5 rounded uppercase font-mono tracking-widest">OUT: ${m.totalOut}</span>
+                                    <tbody class="divide-y divide-slate-100 text-slate-700">
+                                        ${isEdit ? `<tr class="bg-indigo-50/50">
+                                            <td></td>
+                                            <td class="px-6 py-4 space-y-2">
+                                                <input class="w-full p-2 border border-indigo-200 rounded outline-none font-bold" placeholder="品名" value="${d.name||''}" oninput="App.updateEditForm('name', this.value)">
+                                                <div class="flex gap-2">
+                                                    <input class="w-1/2 p-2 border border-indigo-200 rounded text-xs font-mono" placeholder="型號" value="${d.model||''}" oninput="App.updateEditForm('model', this.value)">
+                                                    <input class="w-1/2 p-2 border border-indigo-200 rounded text-xs" placeholder="分類" value="${d.category||''}" oninput="App.updateEditForm('category', this.value)">
+                                                </div>
                                             </td>
-                                            <td class="px-8 py-6 text-center"><div class="inline-block min-w-[70px] px-3 py-2 rounded-2xl font-black text-xl tracking-tighter border font-mono ${m.isEmpty ? 'bg-red-50 text-red-600 border-red-100' : m.isLow ? 'bg-amber-50 text-amber-600 border-amber-100' : 'bg-slate-50 text-slate-700 border-slate-200'}">${m.stock}</div></td>
-                                            <td class="px-8 py-6 text-center"><div class="flex justify-center gap-3 opacity-0 group-hover:opacity-100 transition-all">
-                                                <button onclick='App.startEdit("material", "${m.id}", ${JSON.stringify(m).replace(/'/g, "&apos;")})' class="text-slate-300 hover:text-blue-600"><i data-lucide="edit-3" size="18"></i></button>
-                                                <button onclick="App.deleteDoc('materials', '${m.id}', '從合約中移除？')" class="text-slate-300 hover:text-red-500"><i data-lucide="trash-2" size="18"></i></button>
-                                            </div></td>
+                                            <td class="px-6 py-4 text-center">
+                                                <input type="number" class="w-20 p-2 border border-indigo-200 rounded text-center font-mono text-xs" placeholder="合約數" value="${d.contractQty||0}" oninput="App.updateEditForm('contractQty', this.value)">
+                                                <input class="w-12 mt-1 p-2 border border-indigo-200 rounded text-center text-xs" placeholder="單位" value="${d.unit||'EA'}" oninput="App.updateEditForm('unit', this.value)">
+                                            </td>
+                                            <td class="px-6 py-4 text-center">
+                                                <input type="number" class="w-24 p-2 border border-amber-300 rounded text-center text-xs" placeholder="安全存量" value="${d.safetyStock||0}" title="安全存量" oninput="App.updateEditForm('safetyStock', this.value)">
+                                                <div class="text-[10px] text-amber-600 mt-1">安全水位設定</div>
+                                            </td>
+                                            <td colspan="2" class="px-6 py-4 text-center">
+                                                <div class="flex justify-center gap-2">
+                                                    <button onclick="App.saveMaterial(false)" class="p-2 bg-indigo-600 text-white rounded hover:bg-indigo-700"><i data-lucide="save" size="16"></i></button>
+                                                    <button onclick="App.cancelEdit()" class="p-2 bg-white text-slate-500 rounded border hover:bg-slate-50"><i data-lucide="x" size="16"></i></button>
+                                                </div>
+                                            </td>
+                                        </tr>` : ''}
+                                        ${proc.map(m => `
+                                        <tr class="hover:bg-slate-50 transition-colors">
+                                            <td class="px-6 py-4">
+                                                ${m.isEmpty ? '<span class="w-3 h-3 rounded-full bg-red-500 block mx-auto" title="缺料"></span>' : 
+                                                  m.isLow ? '<span class="w-3 h-3 rounded-full bg-amber-400 block mx-auto" title="低於安全庫存"></span>' : 
+                                                  '<span class="w-3 h-3 rounded-full bg-emerald-400 block mx-auto" title="健康"></span>'}
+                                            </td>
+                                            <td class="px-6 py-4">
+                                                <div class="font-bold text-slate-800">${m.name}</div>
+                                                <div class="text-xs text-slate-500 mt-1 flex gap-2">
+                                                    <span class="bg-slate-100 px-1.5 py-0.5 rounded">${m.category || '未分類'}</span>
+                                                    <span class="font-mono">M: ${m.model || '-'}</span>
+                                                </div>
+                                            </td>
+                                            <td class="px-6 py-4 text-center">
+                                                <div class="font-mono font-bold">${m.contractQty}</div>
+                                                <div class="text-[10px] text-slate-400">${m.unit}</div>
+                                            </td>
+                                            <td class="px-6 py-4 text-center font-mono text-xs">
+                                                <div class="text-emerald-600">IN: ${m.totalIn}</div>
+                                                <div class="${m.isOver ? 'text-red-600 font-bold' : 'text-slate-500'}">OUT: ${m.totalOut}</div>
+                                            </td>
+                                            <td class="px-6 py-4 text-center">
+                                                <div class="inline-block px-3 py-1 rounded border font-mono font-bold ${m.isEmpty ? 'bg-red-50 text-red-600 border-red-200' : m.isLow ? 'bg-amber-50 text-amber-600 border-amber-200' : 'bg-slate-50 border-slate-200'}">
+                                                    ${m.stock}
+                                                </div>
+                                            </td>
+                                            <td class="px-6 py-4 text-center">
+                                                <div class="flex justify-center gap-3">
+                                                    <button onclick='App.startEdit("material", "${m.id}", ${JSON.stringify(m).replace(/'/g, "&apos;")})' class="text-slate-400 hover:text-indigo-600"><i data-lucide="edit-3" size="16"></i></button>
+                                                    <button onclick="App.deleteDoc('materials', '${m.id}', '警告：從專案BOM移除料件將導致關聯數據脫鉤，確認？')" class="text-slate-400 hover:text-red-500"><i data-lucide="trash-2" size="16"></i></button>
+                                                </div>
+                                            </td>
                                         </tr>`).join('')}
                                     </tbody>
                                 </table>
                             </div>`;
                 } else if (tab === 'form') {
                     const proc = this.getProcessedMaterials();
-                    html = `<div class="max-w-4xl mx-auto bg-white p-16 rounded-[4.5rem] shadow-2xl border border-slate-50 italic">
-                                <h3 class="text-4xl font-black text-slate-900 mb-10 tracking-tighter italic uppercase font-mono tracking-tight underline decoration-blue-500 decoration-8 underline-offset-8">Transaction_Feed</h3>
-                                <form id="log-form" onsubmit="App.submitLog(event)" class="space-y-12">
-                                    <div class="grid grid-cols-1 md:grid-cols-2 gap-10">
-                                        <div class="space-y-3"><label class="text-[10px] font-black text-slate-400 uppercase tracking-widest italic font-mono ml-1">Date_Select</label><input id="f-date" type="date" value="${new Date().toISOString().split('T')[0]}" class="w-full p-6 bg-slate-50 border-2 border-transparent rounded-[2rem] font-black focus:bg-white focus:border-blue-500 outline-none transition-all shadow-inner text-lg font-mono"></div>
-                                        <div class="space-y-3"><label class="text-[10px] font-black text-slate-400 uppercase tracking-widest italic font-mono ml-1">Type</label><select id="f-type" onchange="App.handleFormInput()" class="w-full p-6 bg-slate-50 border-2 border-transparent rounded-[2rem] font-black focus:bg-white focus:border-blue-500 outline-none shadow-inner transition-all appearance-none text-lg">
-                                            <option value="出貨">工地領料 (出庫)</option><option value="進貨">廠商到貨 (入庫)</option></select></div>
-                                        <div class="md:col-span-2 space-y-3"><label class="text-[10px] font-black text-slate-400 uppercase tracking-widest italic font-mono ml-1 underline decoration-blue-500 decoration-2">Select_Contract_Material</label><select id="f-mat" onchange="App.handleFormInput()" class="w-full p-6 bg-slate-50 border-2 border-transparent rounded-[2.5rem] font-black focus:bg-white focus:border-blue-500 outline-none shadow-inner transition-all text-xl italic" required>
-                                            <option value="">-- 由本案合約清單中選取 --</option>${proc.map(m => `<option value="${m.id}">${m.name} | M: ${m.model || '--'} (庫存:${m.stock})</option>`).join('')}</select>
-                                            <div id="f-stock-display" class="hidden px-8 py-4 bg-blue-50/50 rounded-3xl flex justify-between items-center text-blue-600 font-mono italic font-black uppercase text-xs"><span>Current_Stock</span><span id="f-current-stock">0</span></div>
+                    html = `
+                        <div class="max-w-5xl mx-auto bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden flex flex-col md:flex-row">
+                            <!-- Left: Target Info -->
+                            <div class="w-full md:w-1/3 bg-slate-50 p-8 border-r border-slate-200">
+                                <h3 class="text-sm font-bold text-slate-500 uppercase tracking-widest mb-6">目標料件解析</h3>
+                                <div class="space-y-4">
+                                    <div>
+                                        <label class="text-xs font-semibold text-slate-700 block mb-2">作業類型</label>
+                                        <select id="f-type" onchange="App.handleFormInput()" class="w-full p-2.5 bg-white border border-slate-300 rounded-lg text-sm font-semibold outline-none focus:ring-2 focus:ring-indigo-500">
+                                            <option value="出貨">領料單 (Issuing)</option>
+                                            <option value="進貨">入庫單 (Receiving)</option>
+                                        </select>
+                                    </div>
+                                    <div>
+                                        <label class="text-xs font-semibold text-slate-700 block mb-2">指定料號 (SKU)</label>
+                                        <select id="f-mat" onchange="App.handleFormInput()" class="w-full p-2.5 bg-white border border-slate-300 rounded-lg text-sm font-semibold outline-none focus:ring-2 focus:ring-indigo-500" required>
+                                            <option value="">-- 請選擇合約料號 --</option>
+                                            ${proc.map(m => `<option value="${m.id}">${m.name} [${m.model || '無型號'}]</option>`).join('')}
+                                        </select>
+                                    </div>
+                                    
+                                    <div id="f-stock-display" class="hidden mt-6 p-4 bg-white border border-slate-200 rounded-lg shadow-sm">
+                                        <p class="text-xs text-slate-500 font-bold mb-1">系統即時可用品量</p>
+                                        <p class="text-2xl font-black font-mono text-indigo-600" id="f-current-stock">0</p>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <!-- Right: Entry Form -->
+                            <div class="w-full md:w-2/3 p-8">
+                                <h3 class="text-sm font-bold text-slate-500 uppercase tracking-widest mb-6 flex items-center justify-between">
+                                    <span>單據明細輸入</span>
+                                    <span class="text-xs bg-slate-100 px-2 py-1 rounded font-mono text-slate-400"><i data-lucide="barcode" class="inline" size="14"></i> AUTO-GEN</span>
+                                </h3>
+                                <form id="log-form" onsubmit="App.submitLog(event)" class="space-y-6">
+                                    <div class="grid grid-cols-2 gap-6">
+                                        <div>
+                                            <label class="text-xs font-semibold text-slate-700 block mb-2">作業日期</label>
+                                            <input id="f-date" type="date" value="${new Date().toISOString().split('T')[0]}" class="w-full p-3 bg-slate-50 border border-slate-300 rounded-lg text-sm font-mono outline-none focus:bg-white focus:ring-2 focus:ring-indigo-500">
+                                        </div>
+                                        <div>
+                                            <label class="text-xs font-semibold text-slate-700 block mb-2">實際數量 (Qty)</label>
+                                            <input id="f-qty" type="number" step="0.01" oninput="App.handleFormInput()" placeholder="0.00" class="w-full p-3 bg-slate-50 border border-slate-300 rounded-lg text-lg font-black font-mono text-indigo-600 outline-none focus:bg-white focus:ring-2 focus:ring-indigo-500" required>
                                         </div>
                                     </div>
-                                    <div class="grid grid-cols-1 md:grid-cols-2 gap-10">
-                                        <div class="space-y-3"><label class="text-[10px] font-black text-slate-400 uppercase tracking-widest font-mono ml-1 italic">Quantity</label><input id="f-qty" type="number" step="0.01" oninput="App.handleFormInput()" placeholder="0.00" class="w-full p-7 bg-slate-50 border-2 border-transparent rounded-[2.5rem] font-black focus:bg-white focus:border-blue-500 outline-none shadow-inner transition-all text-4xl font-mono text-blue-600 italic" required></div>
-                                        <div class="space-y-3"><label class="text-[10px] font-black text-slate-400 uppercase tracking-widest font-mono ml-1 italic">Notes_Memo</label><input id="f-note" type="text" placeholder="用途、樓層或領用組別" class="w-full p-7 bg-slate-50 border-2 border-transparent rounded-[2.5rem] font-bold focus:bg-white focus:border-blue-500 outline-none shadow-inner transition-all text-lg italic"></div>
+                                    
+                                    <div>
+                                        <label class="text-xs font-semibold text-slate-700 block mb-2">簽單備註 (用途 / 來源)</label>
+                                        <input id="f-note" type="text" placeholder="輸入發料施工段、或進貨供應商單號..." class="w-full p-3 bg-slate-50 border border-slate-300 rounded-lg text-sm outline-none focus:bg-white focus:ring-2 focus:ring-indigo-500">
                                     </div>
-                                    <div id="overload-warning" class="bg-red-50 p-10 rounded-[3.5rem] border border-red-100 hidden space-y-6 animate-in zoom-in italic">
-                                        <div class="flex items-center gap-3 text-red-600 font-black text-lg uppercase tracking-widest font-mono italic"><i data-lucide="alert-triangle" size="24"></i> OVER_CONTRACT_LIMIT</div>
-                                        <textarea id="f-reason" rows="2" placeholder="領料數量將超過合約總額，請詳細填寫超領原因 (強制填寫)..." class="w-full p-6 rounded-[2rem] border border-red-200 outline-none text-sm font-bold shadow-sm italic"></textarea>
+
+                                    <div id="overload-warning" class="bg-red-50 p-4 rounded-lg border border-red-200 hidden">
+                                        <div class="flex items-center gap-2 text-red-600 font-bold text-sm mb-2"><i data-lucide="shield-alert" size="16"></i> 系統阻擋：請求數量超過合約餘額</div>
+                                        <input id="f-reason" type="text" placeholder="必須填寫核准超發之核定文號或特案原因..." class="w-full p-2.5 rounded border border-red-300 outline-none text-sm bg-white">
                                     </div>
-                                    <div class="flex justify-end pt-6 border-t border-slate-50"><button type="submit" class="w-full px-20 py-8 bg-blue-600 text-white rounded-[3rem] font-black text-2xl shadow-2xl hover:bg-blue-700 hover:scale-[1.02] active:scale-95 transition-all tracking-widest uppercase italic font-mono">Sync_Record</button></div>
+
+                                    <div class="pt-6 border-t border-slate-100 flex justify-end">
+                                        <button type="submit" class="px-8 py-3 bg-indigo-600 text-white rounded-lg font-bold shadow-sm hover:bg-indigo-700 flex items-center gap-2"><i data-lucide="check-square" size="18"></i> 寫入異動過帳</button>
+                                    </div>
                                 </form>
-                            </div>`;
+                            </div>
+                        </div>`;
                 } else if (tab === 'logs') {
-                    html = `<div class="bg-white rounded-[4.5rem] shadow-sm border border-slate-100 overflow-hidden italic font-bold">
-                                <table class="w-full text-left font-bold text-sm">
-                                    <thead class="bg-slate-50 text-slate-400 uppercase text-[9px] font-black tracking-widest border-b font-mono italic">
-                                        <tr><th class="p-8">DATE_TIME</th><th class="p-8">TYPE</th><th class="p-8">DESCRIPTION</th><th class="p-8 text-right">QTY</th><th class="p-8 text-center font-mono">OP_UID</th><th class="p-8">MEMO</th></tr>
+                    html = `<div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                                <table class="w-full text-left text-sm whitespace-nowrap">
+                                    <thead class="bg-slate-50 text-slate-500 font-semibold border-b border-slate-200 text-xs">
+                                        <tr><th class="px-6 py-4">系統單號</th><th class="px-6 py-4">作業日期</th><th class="px-6 py-4">動別</th><th class="px-6 py-4">物料追蹤</th><th class="px-6 py-4 text-right">數量</th><th class="px-6 py-4">備註/核准</th><th class="px-6 py-4 text-center">操作員</th></tr>
                                     </thead>
                                     <tbody class="divide-y divide-slate-100 text-slate-700">
                                         ${this.state.logs.map(l => {
                                             const m = this.state.materials.find(mat => String(mat.id) === String(l.materialId));
-                                            return `<tr class="hover:bg-slate-50 transition-all border-l-8 border-transparent hover:border-blue-500 italic">
-                                                <td class="p-8 font-mono text-xs text-slate-400 italic">${l.date}</td>
-                                                <td class="p-8"><span class="px-4 py-1.5 rounded-xl text-[9px] font-black uppercase tracking-widest font-mono ${l.type === '進貨' ? 'bg-emerald-100 text-emerald-700' : 'bg-orange-100 text-orange-700'}">${l.type}</span></td>
-                                                <td class="p-8 font-black text-slate-800 text-lg tracking-tighter uppercase">${m?.name || "已移除項目"}</td>
-                                                <td class="p-8 text-right font-black text-2xl font-mono tracking-tighter italic">${l.type === '進貨' ? '+' : '-'}${l.qty}</td>
-                                                <td class="p-8 font-mono text-[9px] text-slate-400 text-center uppercase bg-slate-50 rounded-lg font-black tracking-tighter">${l.user.slice(-6)}</td>
-                                                <td class="p-8 text-slate-400 text-xs font-bold italic line-clamp-1 max-w-xs">${l.note || "-"}</td>
+                                            return `<tr class="hover:bg-slate-50 transition-colors">
+                                                <td class="px-6 py-3 font-mono text-xs text-slate-500">${l.voucherNo || '-'}</td>
+                                                <td class="px-6 py-3 font-mono text-xs">${l.date}</td>
+                                                <td class="px-6 py-3"><span class="px-2 py-1 rounded text-[10px] font-bold border ${l.type === '進貨' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-indigo-50 text-indigo-700 border-indigo-200'}">${l.type}</span></td>
+                                                <td class="px-6 py-3">
+                                                    <div class="font-bold text-slate-800">${m?.name || "[物料已刪除]"}</div>
+                                                    <div class="text-[10px] text-slate-400 font-mono mt-0.5">M: ${m?.model || '-'}</div>
+                                                </td>
+                                                <td class="px-6 py-3 text-right font-mono font-bold text-base ${l.type === '進貨' ? 'text-emerald-600' : 'text-slate-800'}">${l.type === '進貨' ? '+' : '-'}${l.qty}</td>
+                                                <td class="px-6 py-3 text-xs truncate max-w-[200px]" title="${l.note || '-'}">${l.note || "-"}</td>
+                                                <td class="px-6 py-3 text-center"><span class="font-mono text-[10px] bg-slate-100 px-2 py-1 rounded text-slate-500 border border-slate-200">${l.user.slice(-6)}</span></td>
                                             </tr>`;
                                         }).join('')}
                                     </tbody>
@@ -602,146 +764,167 @@
             renderImportList: function() {
                 const listHtml = this.state.masterMaterials.map(m => {
                     const isSel = this.state.selectedImportIds.includes(m.id);
-                    return `<div onclick="App.toggleImportItem('${m.id}')" class="p-6 bg-slate-50 hover:bg-blue-50 rounded-[2.5rem] cursor-pointer mb-3 flex justify-between items-center transition-all border-2 ${isSel ? 'border-blue-500 bg-blue-50' : 'border-transparent'} group italic">
-                               <div class="flex items-center gap-4">
-                                  <div class="select-box w-7 h-7 rounded-xl border-2 flex items-center justify-center transition-all ${isSel ? 'bg-blue-600 border-blue-600 shadow-lg' : 'bg-white border-slate-300'}">
-                                     ${isSel ? '<i data-lucide="check" class="text-white" size="14"></i>' : ''}
-                                  </div>
-                                  <div><p class="font-black text-xl text-slate-800 tracking-tighter uppercase font-mono">${m.name}</p><p class="text-[10px] text-slate-400 font-bold uppercase mt-0.5 tracking-widest font-mono">MOD: ${m.model || '--'}</p></div>
-                               </div>
-                               <span class="text-[10px] font-black bg-white shadow-sm px-4 py-1.5 rounded-full text-slate-500 font-mono italic uppercase">${m.unit}</span>
-                            </div>`;
+                    return `
+                        <div onclick="App.toggleImportItem('${m.id}')" class="p-4 bg-white rounded-lg border cursor-pointer mb-2 flex items-center gap-4 transition-colors ${isSel ? 'border-indigo-500 ring-1 ring-indigo-500 bg-indigo-50/30' : 'border-slate-200 hover:border-indigo-300'}">
+                            <div class="w-5 h-5 rounded border flex items-center justify-center ${isSel ? 'bg-indigo-600 border-indigo-600 text-white' : 'border-slate-300 bg-white'}">
+                                ${isSel ? '<i data-lucide="check" size="12"></i>' : ''}
+                            </div>
+                            <div class="flex-1">
+                                <div class="font-bold text-sm text-slate-800">${m.name}</div>
+                                <div class="text-xs text-slate-500 font-mono mt-0.5">${m.model || '無型號'} | ${m.spec || '無規格'}</div>
+                            </div>
+                            <div class="text-xs font-mono bg-slate-100 px-2 py-1 rounded text-slate-600 border border-slate-200">${m.unit}</div>
+                        </div>`;
                 }).join('');
-                document.getElementById('import-list-container').innerHTML = listHtml || '<p class="text-center py-20 text-slate-300 font-bold uppercase italic tracking-widest">Master_Lib_Empty</p>';
+                document.getElementById('import-list-container').innerHTML = listHtml || '<p class="text-center py-10 text-slate-400 font-medium text-sm">主檔目前沒有資料</p>';
                 lucide.createIcons();
             },
 
             showToast: function(msg, type = 'success') {
                 const toast = document.createElement('div');
-                const bg = type === 'success' ? 'bg-slate-900' : 'bg-red-600';
-                toast.className = `fixed bottom-10 left-1/2 -translate-x-1/2 ${bg} text-white px-10 py-5 rounded-[2.5rem] font-black text-sm shadow-2xl z-[500] animate-in slide-in-from-bottom duration-300 italic tracking-widest uppercase font-mono flex items-center gap-3`;
-                toast.innerHTML = `<i data-lucide="${type === 'success' ? 'check-circle' : 'alert-octagon'}" size="20"></i> ${msg}`;
+                const isErr = type === 'error';
+                toast.className = `fixed bottom-6 right-6 flex items-center gap-3 px-6 py-4 rounded-lg shadow-lg z-[500] animate-in slide-in-from-right duration-300 font-semibold text-sm ${isErr ? 'bg-red-600 text-white' : 'bg-slate-900 text-white'}`;
+                toast.innerHTML = `<i data-lucide="${isErr ? 'alert-circle' : 'check-circle'}" size="18"></i> <span>${msg}</span>`;
                 document.body.appendChild(toast);
                 lucide.createIcons();
                 setTimeout(() => {
-                    toast.classList.add('animate-out', 'fade-out', 'translate-y-10');
-                    setTimeout(() => toast.remove(), 500);
+                    toast.classList.add('opacity-0', 'translate-y-2');
+                    setTimeout(() => toast.remove(), 300);
                 }, 3000);
             },
 
             seedMasterLibrary: async function() {
-                if(!confirm('載入行業常用標準規格主檔？')) return;
+                if(!confirm('將寫入工程常用之標準 SKU 主檔，確定執行？')) return;
                 const batch = writeBatch(db);
                 MASTER_SAMPLES.forEach(m => {
                     const mid = `master_${Math.random().toString(36).substr(2, 9)}`;
                     batch.set(doc(db, 'artifacts', appId, 'public', 'data', 'master_materials', mid), { ...m, updatedAt: new Date().toISOString(), updatedBy: this.state.user.uid });
                 });
                 await batch.commit();
-                this.showToast("標準庫載入完成");
+                this.showToast("主檔資料寫入完成");
             }
         };
 
         window.onload = () => App.init();
     </script>
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;700;900&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700;900&family=JetBrains+Mono:wght@400;700&display=swap');
         body { font-family: 'Noto Sans TC', sans-serif; }
-        .nav-btn { transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
-        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
-        .custom-scrollbar::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 10px; }
+        .font-mono { font-family: 'JetBrains Mono', monospace; }
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; height: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
         input[type="number"]::-webkit-inner-spin-button { display: none; }
-        .animate-in { animation: fadeIn 0.4s ease-out; }
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-        .zoom-in { animation: zoomIn 0.3s cubic-bezier(0.34, 1.56, 0.64, 1); }
-        @keyframes zoomIn { from { transform: scale(0.95); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+        .animate-in { animation: fadeIn 0.3s ease-out forwards; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
     </style>
 </head>
-<body class="bg-[#f8fafc] h-screen overflow-hidden flex flex-col md:flex-row font-black text-slate-900 italic">
+<body class="bg-slate-50 h-screen overflow-hidden flex flex-col md:flex-row text-slate-900">
 
-    <!-- Sidebar -->
-    <nav class="w-full md:w-80 bg-[#0f172a] text-white p-10 flex flex-col shrink-0 shadow-2xl z-20">
-        <div class="mb-12 text-center">
-            <h1 class="text-4xl font-black text-blue-400 tracking-tighter italic uppercase font-serif">Material Hub</h1>
-            <p class="text-slate-500 text-[9px] font-bold uppercase tracking-[0.4em] mt-2 border-b border-slate-800 pb-4 font-mono">WU CHI CHUNG<br>EXCELLENCE FLAGSHIP V24</p>
+    <!-- 左側專業選單 -->
+    <nav class="w-full md:w-64 bg-slate-900 text-slate-300 flex flex-col shrink-0 border-r border-slate-800 z-20">
+        <div class="p-6 border-b border-slate-800">
+            <div class="flex items-center gap-3 text-white mb-1">
+                <i data-lucide="box" size="24" class="text-indigo-500"></i>
+                <h1 class="text-xl font-bold tracking-tight">Material Hub</h1>
+            </div>
+            <p class="text-[10px] font-mono text-slate-500 tracking-widest uppercase">ERP Core v2.5</p>
         </div>
 
-        <div class="space-y-1 flex-1">
-            <button id="nav-project_select" onclick="App.switchTab('project_select')" class="nav-btn w-full flex items-center gap-4 px-6 py-4 rounded-[2rem] transition font-black bg-blue-600 text-white shadow-xl italic tracking-widest text-sm uppercase">
-                <i data-lucide="briefcase" size="18"></i> 專案管理中心
+        <div class="flex-1 overflow-y-auto py-4 px-3 space-y-1 custom-scrollbar">
+            <div class="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-2 px-3 mt-2">System 系統總區</div>
+            <button id="nav-project_select" onclick="App.switchTab('project_select')" class="nav-btn w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition-colors text-sm font-medium hover:bg-slate-800 hover:text-white">
+                <i data-lucide="folders" size="16"></i> 專案樞紐中心
             </button>
-            <button id="nav-master_library" onclick="App.switchTab('master_library')" class="nav-btn w-full flex items-center gap-4 px-6 py-4 rounded-[2rem] transition font-black text-slate-400 hover:bg-slate-800 italic tracking-widest text-sm uppercase font-mono">
-                <i data-lucide="database" size="18"></i> 名稱庫主檔
+            <button id="nav-master_library" onclick="App.switchTab('master_library')" class="nav-btn w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition-colors text-sm font-medium hover:bg-slate-800 hover:text-white">
+                <i data-lucide="database" size="16"></i> 標準物料主檔
             </button>
 
-            <div id="sidebar-project-info" class="pt-10 mt-10 border-t border-slate-800 hidden animate-in slide-in-from-left duration-300">
-                <p id="sidebar-project-name" class="px-6 text-[10px] font-black text-blue-500 uppercase tracking-widest truncate mb-6 font-mono italic underline decoration-blue-500 decoration-2 underline-offset-8">-- PROJECT --</p>
-                <div class="space-y-1 font-mono uppercase tracking-tight">
-                    <button id="nav-dashboard" onclick="App.switchTab('dashboard')" class="nav-btn w-full flex items-center gap-4 px-6 py-3.5 rounded-xl hover:bg-slate-800 text-slate-400 text-xs font-black transition-all italic">
-                        <i data-lucide="layout-dashboard" size="14"></i> Dashboard_Stats
+            <div id="sidebar-project-info" class="pt-6 mt-4 border-t border-slate-800 hidden">
+                <div class="text-[10px] font-bold text-indigo-400 uppercase tracking-widest mb-2 px-3">Active Project 作業專案</div>
+                <div class="px-3 mb-4">
+                    <p id="sidebar-project-name" class="font-mono text-xs text-white font-bold"></p>
+                    <p id="sidebar-project-desc" class="text-xs text-slate-400 truncate mt-0.5"></p>
+                </div>
+                <div class="space-y-1">
+                    <button id="nav-dashboard" onclick="App.switchTab('dashboard')" class="nav-btn w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition-colors text-sm font-medium hover:bg-slate-800 hover:text-white">
+                        <i data-lucide="bar-chart-2" size="16"></i> 營運戰情室
                     </button>
-                    <button id="nav-inventory" onclick="App.switchTab('inventory')" class="nav-btn w-full flex items-center gap-4 px-6 py-3.5 rounded-xl hover:bg-slate-800 text-slate-400 text-xs font-black transition-all italic">
-                        <i data-lucide="package" size="14"></i> Contract_Scope
+                    <button id="nav-inventory" onclick="App.switchTab('inventory')" class="nav-btn w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition-colors text-sm font-medium hover:bg-slate-800 hover:text-white">
+                        <i data-lucide="list-tree" size="16"></i> 合約 BOM 表
                     </button>
-                    <button id="nav-form" onclick="App.switchTab('form')" class="nav-btn w-full flex items-center gap-4 px-6 py-3.5 rounded-xl hover:bg-slate-800 text-slate-400 text-xs font-black transition-all italic">
-                        <i data-lucide="plus-circle" size="14"></i> Sync_Records
+                    <button id="nav-form" onclick="App.switchTab('form')" class="nav-btn w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition-colors text-sm font-medium hover:bg-slate-800 hover:text-white">
+                        <i data-lucide="scan-line" size="16"></i> 庫存異動作業
                     </button>
-                    <button id="nav-logs" onclick="App.switchTab('logs')" class="nav-btn w-full flex items-center gap-4 px-6 py-3.5 rounded-xl hover:bg-slate-800 text-slate-400 text-xs font-black transition-all italic">
-                        <i data-lucide="history" size="14"></i> Transaction_Logs
+                    <button id="nav-logs" onclick="App.switchTab('logs')" class="nav-btn w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition-colors text-sm font-medium hover:bg-slate-800 hover:text-white">
+                        <i data-lucide="history" size="16"></i> 稽核日誌
                     </button>
                 </div>
             </div>
         </div>
 
-        <div class="mt-auto pt-8 border-t border-slate-800 space-y-4">
-            <div class="flex items-center gap-4">
-                <div id="user-initial" class="w-12 h-12 rounded-[1.2rem] bg-blue-600/20 flex items-center justify-center border border-blue-500/30 text-blue-400 font-black shadow-inner font-mono text-xl">?</div>
-                <div>
-                    <p class="text-[10px] text-slate-500 font-black uppercase tracking-tighter italic">Designer: WU CHI CHUNG</p>
-                    <p class="text-sm font-black text-slate-200 italic font-mono tracking-tighter">在線：<span id="global-count">0</span> 人</p>
-                    <p class="text-[9px] text-slate-600 font-mono tracking-tighter mt-1 uppercase">UID: <span id="user-id">------</span></p>
+        <div class="p-4 border-t border-slate-800 bg-slate-900/50">
+            <div class="flex items-center gap-3">
+                <div id="user-initial" class="w-8 h-8 rounded bg-indigo-600 flex items-center justify-center text-white font-bold text-sm shadow-inner">U</div>
+                <div class="flex-1 min-w-0">
+                    <p class="text-[10px] text-slate-400 font-medium">開發者：吳啓仲</p>
+                    <div class="flex justify-between items-center mt-0.5">
+                        <p class="text-[10px] font-mono text-slate-500">ID:<span id="user-id">----</span></p>
+                        <p class="text-[10px] text-slate-500 flex items-center gap-1"><i data-lucide="users" size="10"></i><span id="global-count">0</span></p>
+                    </div>
                 </div>
             </div>
         </div>
     </nav>
 
-    <!-- Main Content -->
-    <main id="main-area" class="flex-1 overflow-y-auto custom-scrollbar relative bg-[#f8fafc]">
-        <div class="h-full flex items-center justify-center animate-pulse">
-            <div class="flex flex-col items-center gap-4 italic font-black uppercase tracking-widest text-xs text-slate-400">
-                <i data-lucide="refresh-cw" class="animate-spin text-blue-500" size="32"></i>
-                Connecting with Cloud_Hub...
+    <!-- 工作區 -->
+    <main id="main-area" class="flex-1 overflow-y-auto custom-scrollbar relative">
+        <div class="h-full flex items-center justify-center">
+            <div class="flex flex-col items-center gap-3 text-slate-400">
+                <i data-lucide="loader-2" class="animate-spin text-indigo-500" size="28"></i>
+                <p class="text-sm font-medium">Connecting to Enterprise Cloud...</p>
             </div>
         </div>
     </main>
 
-    <!-- Modals -->
-    <div id="modal-create-project" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[100] flex items-center justify-center p-6 hidden">
-        <div class="bg-white w-full max-w-2xl p-16 rounded-[4.5rem] shadow-2xl border-t-8 border-blue-600 animate-in zoom-in italic">
-            <h2 class="text-5xl font-black text-slate-900 mb-2 tracking-tighter italic uppercase text-center tracking-widest">Establish_Project</h2>
-            <p class="text-slate-400 text-[10px] font-black uppercase tracking-widest mb-12 italic underline decoration-blue-500 decoration-4 text-center font-mono">Authorized_Developer: WU CHI CHUNG</p>
-            <div class="space-y-8">
-                <div class="space-y-2"><label class="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1 font-mono italic">Project_Full_Name</label>
-                    <input id="new-proj-name" type="text" placeholder="工程中文全銜" class="w-full p-7 bg-slate-50 border-2 border-transparent rounded-[2rem] font-black text-xl outline-none focus:bg-white focus:border-blue-500 transition-all shadow-inner italic uppercase"></div>
-                <div class="space-y-2"><label class="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1 font-mono italic">Contract_Serial_No</label>
-                    <input id="new-proj-no" type="text" placeholder="如 CON-2026-YT01" class="w-full p-7 bg-slate-50 border-2 border-transparent rounded-[2rem] font-mono font-black text-xl outline-none focus:bg-white focus:border-blue-500 transition-all shadow-inner tracking-widest italic text-blue-600"></div>
-                <div class="flex gap-4 pt-4">
-                    <button onclick="App.closeCreateModal()" class="flex-1 py-7 font-black text-slate-400 hover:text-slate-800 transition tracking-widest uppercase font-mono">Cancel</button>
-                    <button onclick="App.createProject()" class="flex-1 bg-blue-600 text-white py-7 rounded-[2.5rem] font-black shadow-2xl hover:bg-blue-700 active:scale-95 transition-all text-xl uppercase tracking-tighter font-mono italic">Establish_Now</button>
+    <!-- 模態框：立項 -->
+    <div id="modal-create-project" class="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-[100] flex items-center justify-center p-4 hidden">
+        <div class="bg-white w-full max-w-md rounded-xl shadow-2xl border border-slate-200 overflow-hidden animate-in">
+            <div class="p-6 border-b border-slate-100 bg-slate-50">
+                <h2 class="text-xl font-bold text-slate-800">建立新專案</h2>
+                <p class="text-xs text-slate-500 mt-1">開發配置授權：吳啓仲</p>
+            </div>
+            <div class="p-6 space-y-4">
+                <div>
+                    <label class="text-xs font-semibold text-slate-700 block mb-1.5">專案全銜</label>
+                    <input id="new-proj-name" type="text" placeholder="例如：總部大樓機電工程" class="w-full p-2.5 border border-slate-300 rounded-lg text-sm outline-none focus:ring-2 focus:ring-indigo-500 transition-shadow">
                 </div>
+                <div>
+                    <label class="text-xs font-semibold text-slate-700 block mb-1.5">合約代號 (Project ID)</label>
+                    <input id="new-proj-no" type="text" placeholder="例：PRJ-2026-001" class="w-full p-2.5 border border-slate-300 rounded-lg text-sm font-mono outline-none focus:ring-2 focus:ring-indigo-500 transition-shadow">
+                </div>
+            </div>
+            <div class="p-4 bg-slate-50 border-t border-slate-100 flex justify-end gap-3">
+                <button onclick="App.closeCreateModal()" class="px-4 py-2 text-sm font-medium text-slate-600 hover:bg-slate-200 rounded-lg transition-colors">取消</button>
+                <button onclick="App.createProject()" class="px-4 py-2 text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg shadow-sm transition-colors">確認建檔</button>
             </div>
         </div>
     </div>
 
-    <!-- Batch Import Modal -->
-    <div id="modal-import" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[100] flex items-center justify-center p-6 hidden">
-        <div class="bg-white w-full max-w-3xl p-12 rounded-[4rem] shadow-2xl flex flex-col max-h-[85vh] animate-in zoom-in border-t-8 border-blue-600 italic">
-            <div class="flex justify-between items-center mb-8">
-                <div><h3 class="text-4xl font-black tracking-tighter italic font-mono uppercase">Batch_Import_Hub</h3>
-                <p class="text-slate-400 font-bold text-[10px] mt-2 uppercase tracking-widest font-mono italic">Select Items from Global Master_Library</p></div>
-                <button onclick="document.getElementById('modal-import').classList.add('hidden')" class="p-2 hover:bg-slate-100 rounded-full transition"><i data-lucide="x"></i></button>
+    <!-- 模態框：BOM 匯入 -->
+    <div id="modal-import" class="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-[100] flex items-center justify-center p-4 hidden">
+        <div class="bg-white w-full max-w-2xl rounded-xl shadow-2xl flex flex-col max-h-[85vh] border border-slate-200 animate-in">
+            <div class="p-6 border-b border-slate-100 flex justify-between items-center bg-slate-50">
+                <div>
+                    <h3 class="text-lg font-bold text-slate-800">標準 BOM 表匯入</h3>
+                    <p class="text-xs text-slate-500 mt-1">自全域主檔選擇所需 SKU 加入本案</p>
+                </div>
+                <button onclick="document.getElementById('modal-import').classList.add('hidden')" class="p-1.5 hover:bg-slate-200 rounded text-slate-500 transition-colors"><i data-lucide="x" size="20"></i></button>
             </div>
-            <div id="import-list-container" class="overflow-y-auto pr-2 custom-scrollbar flex-1"></div>
-            <div class="mt-8 flex gap-4 pt-6 border-t border-slate-50"><button onclick="App.executeBatchImport()" class="flex-1 bg-blue-600 text-white py-7 rounded-[3rem] font-black text-xl shadow-2xl hover:bg-blue-700 transition active:scale-95 italic tracking-widest uppercase font-mono">Confirm_Batch_Import</button></div>
+            <div id="import-list-container" class="overflow-y-auto p-6 flex-1 custom-scrollbar bg-slate-50/50"></div>
+            <div class="p-4 border-t border-slate-100 bg-white flex justify-end">
+                <button onclick="App.executeBatchImport()" class="px-6 py-2 bg-indigo-600 text-white rounded-lg text-sm font-bold shadow-sm hover:bg-indigo-700 transition-colors">寫入合約清單</button>
+            </div>
         </div>
     </div>
 
