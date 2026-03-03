@@ -3,37 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>工程材料管制系統 - 企業旗艦穩定版</title>
-    <!-- Tailwind CSS -->
+    <title>工程材料管制系統 - 企業精簡版</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <!-- Lucide Icons -->
     <script src="https://unpkg.com/lucide@latest"></script>
-    <!-- Firebase SDK -->
-    <script type="module">
-        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, collection, doc, setDoc, onSnapshot, deleteDoc, runTransaction, writeBatch, addDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
-
-        // --- 1. Firebase 安全配置 ---
-        let firebaseConfig = {};
-        try {
-            if (typeof __firebase_config !== 'undefined') {
-                firebaseConfig = typeof __firebase_config === 'string' ? JSON.parse(__firebase_config) : __firebase_config;
-            }
-        } catch (e) {
-            console.error("配置解析失敗", e);
-        }
-
-        const appId = typeof __app_id !== 'undefined' ? __app_id : 'material-hub-enterprise-v4';
-        
-        let app = null, auth = null, db = null;
-        if (Object.keys(firebaseConfig).length > 0) {
-            app = initializeApp(firebaseConfig);
-            auth = getAuth(app);
-            db = getFirestore(app);
-        }
-
-        // --- 2. 標準物料主檔 ---
+    
+    <script>
         const MASTER_SAMPLES = [
             { name: "預拌混凝土 4000psi", brand: "台泥/國產", model: "HFC-4000", spec: "符合 CNS 3036 規範", unit: "m3", category: "結構工程" },
             { name: "竹節鋼筋 #4 (D13)", brand: "東和鋼鐵", model: "SD420W", spec: "熱軋竹節鋼筋", unit: "ton", category: "結構工程" },
@@ -42,17 +16,16 @@
             { name: "ABC乾粉滅火器 10型", brand: "蓄壓式", model: "ABC-10", spec: "附原廠掛勾與標示牌", unit: "具", category: "消防設備" }
         ];
 
-        // --- 3. 全域狀態與 ERP 邏輯 ---
         window.App = {
             state: {
-                user: null,
+                user: { uid: 'local-admin-888' },
                 activeTab: 'project_select',
                 currentProject: null,
                 projects: [],
                 materials: [],
-                masterMaterials: [],
+                masterMaterials: MASTER_SAMPLES.map(m => ({...m, id: 'master_' + Math.random().toString(36).substr(2, 9)})),
                 logs: [],
-                globalUserCount: 0,
+                globalUserCount: 1,
                 searchTerm: '',
                 selectedImportIds: [],
                 editingId: null,
@@ -69,71 +42,12 @@
                 return `${prefix}-${datePart}-${randomPart}`;
             },
 
-            init: async function() {
-                if (!app || !auth || !db) {
-                    document.getElementById('main-area').innerHTML = `<div class="h-full flex flex-col items-center justify-center"><i data-lucide="alert-triangle" class="text-red-500 mb-4" size="48"></i><p class="text-lg font-bold text-slate-700">系統無法啟動</p><p class="text-sm text-slate-500 mt-2">缺少有效的資料庫連線配置 (Firebase Config)</p></div>`;
-                    lucide.createIcons();
-                    return;
-                }
-
-                try {
-                    if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-                        await signInWithCustomToken(auth, __initial_auth_token);
-                    } else {
-                        await signInAnonymously(auth);
-                    }
-                    
-                    onAuthStateChanged(auth, (user) => {
-                        if (user) {
-                            this.state.user = user;
-                            document.getElementById('user-id').innerText = user.uid.slice(-6);
-                            document.getElementById('user-initial').innerText = user.uid.charAt(0).toUpperCase();
-                            this.initGlobalSync();
-                            this.renderSidebar();
-                            this.render();
-                        }
-                    });
-                } catch (e) {
-                    console.error("Auth Fail:", e);
-                    this.showToast("驗證異常，請重新整理頁面", "error");
-                }
-            },
-
-            initGlobalSync: function() {
-                onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'projects'), s => {
-                    this.state.projects = s.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
-                    this.render();
-                });
-                onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'master_materials'), s => {
-                    this.state.masterMaterials = s.docs.map(d => ({ id: d.id, ...d.data() }));
-                    this.render();
-                });
-
-                const statsRef = doc(db, 'artifacts', appId, 'public', 'data', 'stats', 'global');
-                onSnapshot(statsRef, d => {
-                    if (d.exists()) {
-                        this.state.globalUserCount = d.data().userCount || 0;
-                        const countEl = document.getElementById('global-count');
-                        if(countEl) countEl.innerText = this.state.globalUserCount;
-                    }
-                });
-
-                runTransaction(db, async (t) => {
-                    const d = await t.get(statsRef);
-                    if (!d.exists()) t.set(statsRef, { userCount: 1 });
-                    else t.update(statsRef, { userCount: (d.data().userCount || 0) + 1 });
-                }).catch(()=>{});
-            },
-
-            syncProjectData: function(projId) {
-                onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'materials'), s => {
-                    this.state.materials = s.docs.map(d => ({ id: d.id, ...d.data() })).filter(m => m.projectId === projId);
-                    this.render();
-                });
-                onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'logs'), s => {
-                    this.state.logs = s.docs.map(d => ({ id: d.id, ...d.data() })).filter(l => l.projectId === projId).sort((a,b) => new Date(b.createdAt || b.date) - new Date(a.createdAt || a.date));
-                    this.render();
-                });
+            init: function() {
+                document.getElementById('user-id').innerText = this.state.user.uid.slice(-6);
+                document.getElementById('user-initial').innerText = 'A';
+                document.getElementById('global-count').innerText = this.state.globalUserCount;
+                this.renderSidebar();
+                this.render();
             },
 
             switchTab: function(tab) {
@@ -149,7 +63,6 @@
                 const proj = this.state.projects.find(p => p.id === id);
                 if (proj) {
                     this.state.currentProject = proj;
-                    this.syncProjectData(id);
                     this.switchTab('dashboard');
                 }
             },
@@ -162,66 +75,78 @@
             openCreateModal: () => document.getElementById('modal-create-project').classList.remove('hidden'),
             closeCreateModal: () => document.getElementById('modal-create-project').classList.add('hidden'),
 
-            createProject: async function() {
+            createProject: function() {
                 const name = document.getElementById('new-proj-name').value;
                 const conNo = document.getElementById('new-proj-no').value;
                 if (!name || !conNo) return this.showToast("專案名稱與代號為必填", "error");
+                
                 const id = `proj_${Date.now()}`;
-                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'projects', id), {
+                this.state.projects.unshift({
                     id, name, contractNo: conNo, owner: this.state.user.uid, createdAt: new Date().toISOString()
                 });
+                
                 this.closeCreateModal();
                 this.showToast("新專案已建檔");
+                this.renderListOnly();
             },
 
-            createSampleProject: async function() {
+            createSampleProject: function() {
                 if(!confirm('系統將載入標準示範專案，是否繼續？')) return;
+                
                 const id = `proj_sample_${Date.now()}`;
-                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'projects', id), {
+                this.state.projects.unshift({
                     id, name: "示範專案：高雄三井 Lalaport 新建工程", contractNo: "PRJ-2026-YT01", owner: this.state.user.uid, createdAt: new Date().toISOString()
                 });
-                const batch = writeBatch(db);
+                
                 MASTER_SAMPLES.forEach((m, index) => {
                     const matId = `mat_${Math.random().toString(36).substr(2, 9)}`;
                     const defaultLoc = ['A區-01', '露天堆置場', 'A區-02', '庫房-B', '庫房-C'][index % 5];
-                    batch.set(doc(db, 'artifacts', appId, 'public', 'data', 'materials', matId), { ...m, projectId: id, contractQty: 1000, safetyStock: 50, location: defaultLoc });
+                    this.state.materials.push({ ...m, id: matId, projectId: id, contractQty: 1000, safetyStock: 50, location: defaultLoc });
                 });
-                await batch.commit();
+                
                 this.enterProject(id);
                 this.showToast("範本專案已備妥");
             },
 
-            saveAsProject: async function() {
+            saveAsProject: function() {
                 const newName = prompt("輸入複製專案名稱：", `${this.state.currentProject.name} (複製)`);
                 const newNo = prompt("輸入新專案代號：", `${this.state.currentProject.contractNo}-COPY`);
                 if (!newName || !newNo) return;
+                
                 const newId = `proj_${Date.now()}`;
-                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'projects', newId), {
+                this.state.projects.unshift({
                     id: newId, name: newName, contractNo: newNo, owner: this.state.user.uid, createdAt: new Date().toISOString()
                 });
-                const batch = writeBatch(db);
-                this.state.materials.forEach(m => {
+                
+                const currentMaterials = this.state.materials.filter(m => m.projectId === this.state.currentProject.id);
+                currentMaterials.forEach(m => {
                     const matId = `mat_${Math.random().toString(36).substr(2, 9)}`;
-                    const { id, projectId, ...data } = m;
-                    batch.set(doc(db, 'artifacts', appId, 'public', 'data', 'materials', matId), { ...data, projectId: newId, contractQty: 0, location: '待分配' });
+                    this.state.materials.push({ ...m, id: matId, projectId: newId, contractQty: 0, location: '待分配' });
                 });
-                await batch.commit();
+                
                 this.showToast("BOM 表架構已複製");
                 this.switchTab('project_select');
             },
 
-            deleteDoc: async function(col, id, msg) {
+            deleteDoc: function(col, id, msg) {
                 if (confirm(msg)) {
-                    await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', col, id));
-                    this.showToast("資料已移除");
-                    if (col === 'projects' && this.state.currentProject?.id === id) {
-                        this.state.currentProject = null;
-                        this.switchTab('project_select');
+                    if (col === 'projects') {
+                        this.state.projects = this.state.projects.filter(p => p.id !== id);
+                        if (this.state.currentProject?.id === id) {
+                            this.state.currentProject = null;
+                            this.switchTab('project_select');
+                            return;
+                        }
+                    } else if (col === 'master_materials') {
+                        this.state.masterMaterials = this.state.masterMaterials.filter(m => m.id !== id);
+                    } else if (col === 'materials') {
+                        this.state.materials = this.state.materials.filter(m => m.id !== id);
                     }
+                    this.showToast("資料已移除");
+                    this.renderListOnly();
                 }
             },
 
-            // 將原本依賴 JSON.stringify 傳遞的物件改為僅傳遞 ID 查找，徹底解決引號引發的 Syntax Error
             startEdit: function(type, id) {
                 this.state.editingId = id;
                 this.state.isAddingNew = id === 'new';
@@ -248,25 +173,34 @@
                 this.state.editFormData[field] = value;
             },
 
-            saveMaterial: async function(isMaster) {
+            saveMaterial: function(isMaster) {
                 const d = this.state.editFormData;
                 if (!d.name) return this.showToast("物料名稱必填", "error");
-                const col = isMaster ? 'master_materials' : 'materials';
+                
+                const list = isMaster ? this.state.masterMaterials : this.state.materials;
                 const prefix = isMaster ? 'sku_' : 'bom_';
-                const finalId = (this.state.editingId && this.state.editingId !== 'new') ? this.state.editingId : `${prefix}${Date.now()}`;
-                const payload = { ...d };
-                if (isMaster) {
-                    payload.updatedBy = this.state.user.uid;
-                    delete payload.location;
-                    delete payload.contractQty;
-                    delete payload.safetyStock;
+                
+                if (this.state.isAddingNew) {
+                    const newId = `${prefix}${Date.now()}`;
+                    const payload = { ...d, id: newId };
+                    if (!isMaster) {
+                        payload.projectId = this.state.currentProject.id;
+                        payload.contractQty = this.n(d.contractQty);
+                        payload.safetyStock = this.n(d.safetyStock);
+                        payload.location = d.location || '未指定';
+                    }
+                    list.unshift(payload);
                 } else {
-                    payload.projectId = this.state.currentProject.id;
-                    payload.contractQty = this.n(d.contractQty);
-                    payload.safetyStock = this.n(d.safetyStock);
-                    payload.location = d.location || '未指定';
+                    const idx = list.findIndex(m => m.id === this.state.editingId);
+                    if (idx > -1) {
+                        if (isMaster) {
+                            list[idx] = { ...list[idx], ...d };
+                        } else {
+                            list[idx] = { ...list[idx], ...d, contractQty: this.n(d.contractQty), safetyStock: this.n(d.safetyStock), location: d.location || '未指定' };
+                        }
+                    }
                 }
-                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', col, finalId), payload, { merge: true });
+                
                 this.cancelEdit();
                 this.showToast("存檔成功");
             },
@@ -284,23 +218,26 @@
                 this.renderImportList();
             },
 
-            executeBatchImport: async function() {
+            executeBatchImport: function() {
                 if (this.state.selectedImportIds.length === 0) return;
-                const batch = writeBatch(db);
+                
                 this.state.selectedImportIds.forEach(id => {
                     const item = this.state.masterMaterials.find(m => m.id === id);
                     if (item) {
                         const matId = `bom_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
-                        batch.set(doc(db, 'artifacts', appId, 'public', 'data', 'materials', matId), {
+                        this.state.materials.unshift({
+                            id: matId,
                             projectId: this.state.currentProject.id, 
                             name: item.name, spec: item.spec || "", model: item.model || "", brand: item.brand || "", unit: item.unit || "EA", category: item.category || "未分類",
                             contractQty: 0, safetyStock: 0, location: "未指定儲位"
                         });
                     }
                 });
-                await batch.commit();
+                
                 document.getElementById('modal-import').classList.add('hidden');
-                this.showToast(`成功匯入 ${this.state.selectedImportIds.length} 筆 SKU，請記得分配儲位`);
+                this.showToast(`成功匯入 ${this.state.selectedImportIds.length} 筆 SKU`);
+                this.state.selectedImportIds = [];
+                this.renderListOnly();
             },
 
             handleFormInput: function() {
@@ -335,7 +272,7 @@
                 }
             },
 
-            submitLog: async function(e) {
+            submitLog: function(e) {
                 e.preventDefault();
                 const matId = document.getElementById('f-mat').value;
                 const qty = this.n(document.getElementById('f-qty').value);
@@ -352,7 +289,8 @@
                 }
 
                 const voucherNo = this.generateVoucherNo(type);
-                await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'logs'), {
+                this.state.logs.unshift({
+                    id: `log_${Date.now()}`,
                     projectId: this.state.currentProject.id, 
                     materialId: matId, 
                     qty, 
@@ -373,10 +311,11 @@
                 if (!this.state.currentProject) return;
                 const h = ["系統單號", "實體單號(Ref)", "作業日期", "異動類型", "物料分類", "物料名稱", "廠牌", "型號", "儲位", "異動數量", "單位", "作業人員", "稽核備註"];
                 
-                // 加入完整的 CSV 逸出處理機制 (處理引號與逗號)
                 const escapeCSV = (str) => `"${String(str).replace(/"/g, '""')}"`;
                 
-                const r = this.state.logs.map(l => {
+                const currentProjectLogs = this.state.logs.filter(l => l.projectId === this.state.currentProject.id);
+                
+                const r = currentProjectLogs.map(l => {
                     const m = this.state.materials.find(mat => String(mat.id) === String(l.materialId));
                     return [
                         l.voucherNo || "無", 
@@ -403,8 +342,11 @@
             },
 
             getProcessedMaterials: function() {
-                return this.state.materials.map(m => {
-                    const mLogs = this.state.logs.filter(l => String(l.materialId) === String(m.id));
+                const projectMaterials = this.state.materials.filter(m => m.projectId === this.state.currentProject?.id);
+                const projectLogs = this.state.logs.filter(l => l.projectId === this.state.currentProject?.id);
+                
+                return projectMaterials.map(m => {
+                    const mLogs = projectLogs.filter(l => String(l.materialId) === String(m.id));
                     const totalIn = mLogs.filter(l => l.type === '進貨').reduce((s, l) => s + this.n(l.qty), 0);
                     const totalOut = mLogs.filter(l => l.type === '出貨').reduce((s, l) => s + this.n(l.qty), 0);
                     const stock = totalIn - totalOut;
@@ -431,7 +373,9 @@
                     pInfo.classList.remove('hidden');
                     document.getElementById('sidebar-project-name').innerText = this.state.currentProject.contractNo;
                     document.getElementById('sidebar-project-desc').innerText = this.state.currentProject.name;
-                } else pInfo.classList.add('hidden');
+                } else {
+                    pInfo.classList.add('hidden');
+                }
             },
 
             render: function() {
@@ -461,18 +405,17 @@
                         <div class="flex justify-between items-end mb-8 border-b border-slate-200 pb-6">
                             <div>
                                 <h2 class="text-3xl font-black text-slate-800 tracking-tight">標準物料主檔 (Master Data)</h2>
-                                <p class="text-sm text-slate-500 mt-2 font-medium">企業級全域 SKU 基礎數據庫</p>
+                                <p class="text-sm text-slate-500 mt-2 font-medium">企業級全域 SKU 基礎數據庫 (不含專案儲位資料)</p>
                             </div>
                             ${!this.state.isAddingNew ? `
                             <div class="flex gap-3">
-                                <button onclick="App.seedMasterLibrary()" class="bg-white border border-slate-300 text-slate-600 px-5 py-2.5 rounded-lg text-sm font-semibold shadow-sm hover:bg-slate-50 transition flex items-center gap-2"><i data-lucide="download-cloud" size="16"></i> 載入內建主檔</button>
                                 <button onclick="App.startEdit('master', 'new')" class="bg-slate-800 text-white px-5 py-2.5 rounded-lg text-sm font-semibold shadow-sm hover:bg-slate-900 transition flex items-center gap-2"><i data-lucide="plus-circle" size="16"></i> 新增 SKU</button>
                             </div>` : ''}
                         </div>
                         ${!this.state.isAddingNew ? `
                         <div class="mb-6 relative max-w-md">
                             <i data-lucide="search" class="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400" size="18"></i>
-                            <input type="text" oninput="App.setSearchTerm(this.value)" value="${this.state.searchTerm}" placeholder="檢索物料名稱、型號或規格..." class="w-full pl-11 pr-4 py-2 bg-white border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 outline-none transition-all">
+                            <input type="text" oninput="App.setSearchTerm(this.value)" value="${this.state.searchTerm}" placeholder="檢索物料名稱、廠牌、型號或規格..." class="w-full pl-11 pr-4 py-2.5 bg-white border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 outline-none transition-all">
                         </div>` : ''}`;
                 } else if (tab === 'dashboard') {
                     headerHtml = `
@@ -576,7 +519,7 @@
                                             <td class="px-6 py-4 text-center font-mono text-xs">${m.unit}</td>
                                             <td class="px-6 py-4 text-center">
                                                 <div class="flex justify-center gap-3">
-                                                    <button onclick="App.startEdit('master', '${m.id}')" class="text-slate-400 hover:text-indigo-600"><i data-lucide="edit-3" size="16"></i></button>
+                                                    <button onclick='App.startEdit("master", "${m.id}")' class="text-slate-400 hover:text-indigo-600"><i data-lucide="edit-3" size="16"></i></button>
                                                     <button onclick="App.deleteDoc('master_materials', '${m.id}', '確認從主檔剔除？')" class="text-slate-400 hover:text-red-500"><i data-lucide="trash-2" size="16"></i></button>
                                                 </div>
                                             </td>
@@ -769,15 +712,9 @@
                                         </div>
                                     </div>
                                     
-                                    <div class="grid grid-cols-2 gap-6">
-                                        <div>
-                                            <label class="text-xs font-semibold text-slate-700 block mb-2">關聯實體單號 (Ref No.)</label>
-                                            <input id="f-refno" type="text" placeholder="供應商出貨單號/工地領料單號..." class="w-full p-3 bg-slate-50 border border-slate-300 rounded-lg text-sm font-mono outline-none focus:bg-white focus:ring-2 focus:ring-indigo-500">
-                                        </div>
-                                        <div>
-                                            <label class="text-xs font-semibold text-slate-700 block mb-2">簽單備註 (用途 / 來源)</label>
-                                            <input id="f-note" type="text" placeholder="輸入發料施工段、或進貨供應商單號..." class="w-full p-3 bg-slate-50 border border-slate-300 rounded-lg text-sm outline-none focus:bg-white focus:ring-2 focus:ring-indigo-500">
-                                        </div>
+                                    <div>
+                                        <label class="text-xs font-semibold text-slate-700 block mb-2">簽單備註 (用途 / 來源)</label>
+                                        <input id="f-note" type="text" placeholder="輸入發料施工段、或進貨供應商單號..." class="w-full p-3 bg-slate-50 border border-slate-300 rounded-lg text-sm outline-none focus:bg-white focus:ring-2 focus:ring-indigo-500">
                                     </div>
 
                                     <div id="overload-warning" class="bg-red-50 p-4 rounded-lg border border-red-200 hidden">
@@ -852,21 +789,9 @@
                     toast.classList.add('opacity-0', 'translate-y-2', 'transition-all');
                     setTimeout(() => toast.remove(), 300);
                 }, 3000);
-            },
-
-            seedMasterLibrary: async function() {
-                if(!confirm('將寫入工程常用之標準 SKU 主檔，確定執行？')) return;
-                const batch = writeBatch(db);
-                MASTER_SAMPLES.forEach(m => {
-                    const mid = `master_${Math.random().toString(36).substr(2, 9)}`;
-                    batch.set(doc(db, 'artifacts', appId, 'public', 'data', 'master_materials', mid), { ...m, updatedAt: new Date().toISOString(), updatedBy: this.state.user.uid });
-                });
-                await batch.commit();
-                this.showToast("主檔資料寫入完成");
             }
         };
 
-        // 直接透過 DOMContentLoaded 呼叫，避免模組化腳本錯過 window.onload
         if (document.readyState === 'loading') {
             document.addEventListener('DOMContentLoaded', () => App.init());
         } else {
@@ -887,7 +812,6 @@
 </head>
 <body class="bg-slate-50 h-screen overflow-hidden flex flex-col md:flex-row text-slate-900">
 
-    <!-- 左側企業級選單 -->
     <nav class="w-full md:w-64 bg-slate-900 text-slate-300 flex flex-col shrink-0 border-r border-slate-800 z-20">
         <div class="p-6 border-b border-slate-800">
             <div class="flex items-center gap-3 text-white mb-1">
@@ -943,17 +867,9 @@
         </div>
     </nav>
 
-    <!-- 工作區 -->
     <main id="main-area" class="flex-1 overflow-y-auto custom-scrollbar relative">
-        <div class="h-full flex items-center justify-center">
-            <div class="flex flex-col items-center gap-3 text-slate-400">
-                <i data-lucide="loader-2" class="animate-spin text-indigo-500" size="28"></i>
-                <p class="text-sm font-medium">Connecting to Enterprise Cloud...</p>
-            </div>
-        </div>
     </main>
 
-    <!-- 模態框：立項 -->
     <div id="modal-create-project" class="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-[100] flex items-center justify-center p-4 hidden">
         <div class="bg-white w-full max-w-md rounded-xl shadow-2xl border border-slate-200 overflow-hidden animate-in">
             <div class="p-6 border-b border-slate-100 bg-slate-50">
@@ -977,7 +893,6 @@
         </div>
     </div>
 
-    <!-- 模態框：BOM 匯入 -->
     <div id="modal-import" class="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-[100] flex items-center justify-center p-4 hidden">
         <div class="bg-white w-full max-w-2xl rounded-xl shadow-2xl flex flex-col max-h-[85vh] border border-slate-200 animate-in">
             <div class="p-6 border-b border-slate-100 flex justify-between items-center bg-slate-50">
