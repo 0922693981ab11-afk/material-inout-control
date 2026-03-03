@@ -1,0 +1,838 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>工程材料管制系統 - 旗艦完整版</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <!-- Firebase SDK -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, doc, setDoc, onSnapshot, deleteDoc, runTransaction, writeBatch } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Firebase 環境配置 ---
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'project-material-ultimate-v100';
+
+        // --- 範本數據 (完整屬性) ---
+        const SAMPLE_MATERIALS = [
+            { name: "ABC乾粉滅火器10型", spec: "10型 附標示牌", model: "ABC-10型", unit: "具", contractQty: 1124, category: "消防設備", safetyStock: 10 },
+            { name: "二氧化碳滅火器10型", spec: "10型 附標示牌", model: "NV-CO2-10", unit: "具", contractQty: 224, category: "消防設備", safetyStock: 5 },
+            { name: "室內消防栓箱", spec: "120*70*18_面板 t=2.0", model: "SY-FB-01", unit: "組", contractQty: 38, category: "消防設備", safetyStock: 2 },
+            { name: "PVC 管 2\"-E管", spec: "3.6mm", model: "南亞", unit: "M", contractQty: 195, category: "配管工程", safetyStock: 50 },
+            { name: "鍍鋅鋼管STPG管", spec: "4\" 鑫陽-光固化管", model: "CNS4626", unit: "M", contractQty: 143, category: "配管工程", safetyStock: 30 }
+        ];
+
+        // --- 全域狀態管理中心 (State Management) ---
+        window.App = {
+            state: {
+                user: null,
+                activeTab: 'project_select',
+                currentProject: null,
+                projects: [],
+                materials: [],
+                masterMaterials: [],
+                logs: [],
+                globalUserCount: 0,
+                searchTerm: '',
+                selectedImportIds: [],
+                // 編輯狀態
+                editingId: null,
+                editFormData: {},
+                isAddingNew: false,
+                // 領料表單狀態
+                formType: '出貨',
+                formMatId: '',
+                formQty: '',
+                formNote: '',
+                formDate: new Date().toISOString().split('T')[0],
+                formReason: ''
+            },
+
+            n: (v) => Number(v || 0),
+
+            // --- 核心啟動 ---
+            init: async function() {
+                try {
+                    // RULE 3: 嚴格的身份驗證阻擋
+                    if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                        await signInWithCustomToken(auth, __initial_auth_token);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                    
+                    onAuthStateChanged(auth, (user) => {
+                        if (user) {
+                            this.state.user = user;
+                            document.getElementById('user-id').innerText = user.uid.slice(-6);
+                            document.getElementById('user-initial').innerText = user.uid.slice(0, 1).toUpperCase();
+                            this.initGlobalSync();
+                            this.renderSidebar();
+                            this.render();
+                        }
+                    });
+                } catch (e) {
+                    console.error("Auth Fail:", e);
+                    document.getElementById('main-area').innerHTML = `<div class="p-20 text-center font-black text-red-500 text-2xl">系統連線失敗，請檢查權限或重新整理頁面。</div>`;
+                }
+            },
+
+            // --- 數據同步 (Listeners) ---
+            initGlobalSync: function() {
+                onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'projects'), s => {
+                    this.state.projects = s.docs.map(d => ({ id: d.id, ...d.data() }));
+                    this.render();
+                });
+                onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'master_materials'), s => {
+                    this.state.masterMaterials = s.docs.map(d => ({ id: d.id, ...d.data() }));
+                    this.render();
+                });
+                const statsRef = doc(db, 'artifacts', appId, 'public', 'data', 'stats', 'global');
+                onSnapshot(statsRef, d => {
+                    if (d.exists()) {
+                        this.state.globalUserCount = d.data().userCount || 0;
+                        document.getElementById('global-count').innerText = this.state.globalUserCount;
+                    }
+                });
+                runTransaction(db, async (t) => {
+                    const d = await t.get(statsRef);
+                    if (!d.exists()) t.set(statsRef, { userCount: 1 });
+                    else t.update(statsRef, { userCount: (d.data().userCount || 0) + 1 });
+                }).catch(()=>{});
+            },
+
+            syncProjectData: function(projId) {
+                onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'materials'), s => {
+                    this.state.materials = s.docs.map(d => ({ id: d.id, ...d.data() })).filter(m => m.projectId === projId);
+                    this.render();
+                });
+                onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'logs'), s => {
+                    this.state.logs = s.docs.map(d => ({ id: d.id, ...d.data() })).filter(l => l.projectId === projId).sort((a,b) => new Date(b.date) - new Date(a.date));
+                    this.render();
+                });
+            },
+
+            // --- 控制器 (Controllers) ---
+            switchTab: function(tab) {
+                this.state.activeTab = tab;
+                this.state.editingId = null;
+                this.state.isAddingNew = false;
+                this.state.searchTerm = '';
+                this.renderSidebar();
+                this.render();
+            },
+
+            enterProject: function(id) {
+                const proj = this.state.projects.find(p => p.id === id);
+                if (proj) {
+                    this.state.currentProject = proj;
+                    this.syncProjectData(id);
+                    this.switchTab('dashboard');
+                }
+            },
+
+            setSearchTerm: function(val) {
+                this.state.searchTerm = val;
+                this.renderListOnly();
+            },
+
+            // --- 專案操作 ---
+            createProject: async function() {
+                const name = document.getElementById('new-proj-name').value;
+                const conNo = document.getElementById('new-proj-no').value;
+                if (!name || !conNo) return alert('請填寫完整資訊');
+                const id = `proj_${Date.now()}`;
+                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'projects', id), {
+                    id, name, contractNo: conNo, owner: this.state.user.uid, createdAt: new Date().toISOString()
+                });
+                document.getElementById('modal-create').classList.add('hidden');
+            },
+
+            createSampleProject: async function() {
+                if(!confirm('建立三井 Lalaport 範本專案與測試數據？')) return;
+                const id = `proj_${Date.now()}`;
+                const projData = { id, name: "範例：高雄三井Lalaport新建工程", contractNo: "CON-YT-2026", owner: this.state.user.uid, createdAt: new Date().toISOString() };
+                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'projects', id), projData);
+                
+                const batch = writeBatch(db);
+                SAMPLE_MATERIALS.forEach(m => {
+                    const matId = `mat_${Math.random().toString(36).substr(2, 9)}`;
+                    batch.set(doc(db, 'artifacts', appId, 'public', 'data', 'materials', matId), { ...m, projectId: id });
+                });
+                await batch.commit();
+                this.enterProject(id);
+            },
+
+            saveAsProject: async function() {
+                const newName = prompt("請輸入新專案名稱：", `${this.state.currentProject.name} (副本)`);
+                const newNo = prompt("請輸入新合約編號：", `${this.state.currentProject.contractNo}-COPY`);
+                if (!newName || !newNo) return;
+
+                const newId = `proj_${Date.now()}`;
+                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'projects', newId), {
+                    id: newId, name: newName, contractNo: newNo, owner: this.state.user.uid, createdAt: new Date().toISOString()
+                });
+
+                const batch = writeBatch(db);
+                this.state.materials.forEach(m => {
+                    const matId = `mat_${Math.random().toString(36).substr(2, 9)}`;
+                    const { id, projectId, ...data } = m;
+                    batch.set(doc(db, 'artifacts', appId, 'public', 'data', 'materials', matId), { ...data, projectId: newId, contractQty: m.contractQty || 0 });
+                });
+                await batch.commit();
+                alert("專案架構複製成功！");
+                this.switchTab('project_select');
+            },
+
+            deleteDoc: async function(col, id, confirmMsg) {
+                if (confirm(confirmMsg)) await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', col, id));
+            },
+
+            // --- 庫存與合約編輯 ---
+            startEdit: function(type, id, data) {
+                this.state.editingId = id;
+                this.state.isAddingNew = id === 'new';
+                this.state.editFormData = data || { category: '一般' };
+                this.render();
+            },
+
+            cancelEdit: function() {
+                this.state.editingId = null;
+                this.state.isAddingNew = false;
+                this.state.editFormData = {};
+                this.render();
+            },
+
+            updateEditForm: function(field, value) {
+                this.state.editFormData[field] = value;
+                // 為了不讓 focus 跑掉，只更新內部狀態。綁定的 input 會用 oninput 觸發
+            },
+
+            saveMaterial: async function(isMaster) {
+                const d = this.state.editFormData;
+                if (!d.name) return alert('品名為必填');
+                
+                const col = isMaster ? 'master_materials' : 'materials';
+                const prefix = isMaster ? 'master_' : 'mat_';
+                const finalId = (this.state.editingId && this.state.editingId !== 'new') ? this.state.editingId : `${prefix}${Date.now()}`;
+                
+                const payload = { ...d };
+                if (isMaster) payload.updatedBy = this.state.user.uid;
+                else {
+                    payload.projectId = this.state.currentProject.id;
+                    payload.contractQty = this.n(d.contractQty);
+                    payload.safetyStock = this.n(d.safetyStock);
+                }
+
+                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', col, finalId), payload, { merge: true });
+                this.cancelEdit();
+            },
+
+            // --- 批次導入 ---
+            openBatchImport: function() {
+                this.state.selectedImportIds = [];
+                document.getElementById('modal-import').classList.remove('hidden');
+                this.renderImportList();
+            },
+
+            toggleImportItem: function(id, el) {
+                const idx = this.state.selectedImportIds.indexOf(id);
+                const box = el.querySelector('.select-box');
+                if (idx === -1) {
+                    this.state.selectedImportIds.push(id);
+                    box.classList.remove('bg-white', 'border-slate-300');
+                    box.classList.add('bg-blue-600', 'border-blue-600');
+                    box.innerHTML = '<i data-lucide="check" class="text-white" size="14"></i>';
+                } else {
+                    this.state.selectedImportIds.splice(idx, 1);
+                    box.classList.add('bg-white', 'border-slate-300');
+                    box.classList.remove('bg-blue-600', 'border-blue-600');
+                    box.innerHTML = '';
+                }
+                lucide.createIcons();
+            },
+
+            executeBatchImport: async function() {
+                if (this.state.selectedImportIds.length === 0) return;
+                const batch = writeBatch(db);
+                this.state.selectedImportIds.forEach(id => {
+                    const item = this.state.masterMaterials.find(m => m.id === id);
+                    if (item) {
+                        const matId = `mat_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+                        batch.set(doc(db, 'artifacts', appId, 'public', 'data', 'materials', matId), {
+                            projectId: this.state.currentProject.id, 
+                            name: item.name, spec: item.spec || "", model: item.model || "", unit: item.unit || "具", category: item.category || "一般",
+                            contractQty: 0, safetyStock: 0
+                        });
+                    }
+                });
+                await batch.commit();
+                document.getElementById('modal-import').classList.add('hidden');
+            },
+
+            // --- 表單邏輯 ---
+            handleFormInput: function() {
+                const matId = document.getElementById('f-mat').value;
+                const qty = this.n(document.getElementById('f-qty').value);
+                const type = document.getElementById('f-type').value;
+                
+                const mat = this.state.materials.find(m => String(m.id) === String(matId));
+                if (mat && type === '出貨') {
+                    const mLogs = this.state.logs.filter(l => String(l.materialId) === String(matId));
+                    const totalOut = mLogs.filter(l => l.type === '出貨').reduce((s, l) => s + this.n(l.qty), 0);
+                    const isOver = (totalOut + qty) > this.n(mat.contractQty);
+                    
+                    const w = document.getElementById('overload-warning');
+                    const r = document.getElementById('f-reason');
+                    if (isOver) {
+                        w.classList.remove('hidden');
+                        r.required = true;
+                    } else {
+                        w.classList.add('hidden');
+                        r.required = false;
+                    }
+                } else {
+                    document.getElementById('overload-warning')?.classList.add('hidden');
+                    const r = document.getElementById('f-reason');
+                    if(r) r.required = false;
+                }
+            },
+
+            submitLog: async function(e) {
+                e.preventDefault();
+                const matId = document.getElementById('f-mat').value;
+                const qty = this.n(document.getElementById('f-qty').value);
+                const type = document.getElementById('f-type').value;
+                const note = document.getElementById('f-note').value;
+                const reason = document.getElementById('f-reason')?.value || "";
+
+                if (!matId || !qty) return alert('請完整填寫項目與數量');
+
+                const logId = `log_${Date.now()}`;
+                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'logs', logId), {
+                    projectId: this.state.currentProject.id, materialId: matId, qty, type,
+                    date: document.getElementById('f-date').value,
+                    note: note + (reason ? ` [超領原因: ${reason}]` : ""),
+                    user: this.state.user.uid
+                });
+                
+                // 重置表單並跳轉
+                document.getElementById('log-form').reset();
+                this.switchTab('logs');
+            },
+
+            exportCSV: function() {
+                if (!this.state.currentProject) return;
+                const h = ["日期", "單別", "屬性", "品名", "規格", "型號", "異動數量", "單位", "操作人員", "備註"];
+                const r = this.state.logs.map(l => {
+                    const m = this.state.materials.find(mat => String(mat.id) === String(l.materialId));
+                    return [l.date, l.type, m?.category || "", m?.name || "已刪除項目", m?.spec || "", m?.model || "", l.qty, m?.unit || "", l.user.slice(-6), l.note];
+                });
+                // 加入 UTF-8 BOM 解決 Excel 中文亂碼
+                const content = "\uFEFF" + [h, ...r].map(e => e.join(",")).join("\n");
+                const blob = new Blob([content], { type: 'text/csv;charset=utf-8;' });
+                const link = document.createElement("a");
+                link.href = URL.createObjectURL(blob);
+                link.download = `工程異動紀錄_${this.state.currentProject.contractNo}_${new Date().toISOString().split('T')[0]}.csv`;
+                link.click();
+            },
+
+            // --- 渲染引擎 ---
+            getProcessedMaterials: function() {
+                return this.state.materials.map(m => {
+                    const mLogs = this.state.logs.filter(l => String(l.materialId) === String(m.id));
+                    const totalIn = mLogs.filter(l => l.type === '進貨').reduce((s, l) => s + this.n(l.qty), 0);
+                    const totalOut = mLogs.filter(l => l.type === '出貨').reduce((s, l) => s + this.n(l.qty), 0);
+                    const stock = totalIn - totalOut;
+                    const progress = Math.min(100, Math.round((totalOut / (this.n(m.contractQty) || 1)) * 100));
+                    return { 
+                        ...m, totalIn, totalOut, stock, progress, 
+                        isOver: totalOut > this.n(m.contractQty),
+                        isLow: stock <= this.n(m.safetyStock) && stock > 0,
+                        isEmpty: stock <= 0
+                    };
+                });
+            },
+
+            renderSidebar: function() {
+                document.querySelectorAll('.nav-btn').forEach(b => {
+                    b.classList.remove('bg-blue-600', 'text-white', 'shadow-xl');
+                    b.classList.add('text-slate-400', 'hover:bg-slate-800');
+                });
+                const activeBtn = document.getElementById(`nav-${this.state.activeTab}`);
+                if (activeBtn) {
+                    activeBtn.classList.add('bg-blue-600', 'text-white', 'shadow-xl');
+                    activeBtn.classList.remove('text-slate-400', 'hover:bg-slate-800');
+                }
+
+                const pInfo = document.getElementById('sidebar-project-info');
+                const pGroup = document.getElementById('project-nav-group');
+                if (this.state.currentProject) {
+                    pInfo.classList.remove('hidden');
+                    pGroup.classList.remove('hidden');
+                    document.getElementById('sidebar-project-name').innerText = this.state.currentProject.name;
+                } else {
+                    pInfo.classList.add('hidden');
+                    pGroup.classList.add('hidden');
+                }
+            },
+
+            render: function() {
+                const main = document.getElementById('main-area');
+                if (!main) return;
+                const tab = this.state.activeTab;
+                
+                // Header (搜尋與按鈕) 
+                let headerHtml = '';
+                if (tab === 'project_select') {
+                    headerHtml = `
+                        <div class="flex justify-between items-start mb-10 gap-8">
+                            <div><h2 class="text-5xl font-black text-slate-900 tracking-tighter mb-3">工程開案中心</h2>
+                            <span class="px-3 py-1 bg-emerald-50 text-emerald-600 rounded-full text-[10px] font-black uppercase tracking-widest border border-emerald-100 flex items-center gap-2 w-max"><i data-lucide="shield-check" size="12"></i> 權限驗證成功 | 吳啓仲開發</span></div>
+                            <div class="flex gap-4">
+                                <button onclick="App.createSampleProject()" class="bg-amber-500 text-white px-8 py-4 rounded-3xl font-black shadow-xl hover:bg-amber-600 transition flex items-center gap-2 active:scale-95 text-sm"><i data-lucide="sparkles"></i> 載入三井範本</button>
+                                <button onclick="App.openCreateModal()" class="bg-blue-600 text-white px-8 py-4 rounded-3xl font-black shadow-2xl hover:bg-blue-700 transition active:scale-95 flex items-center gap-2"><i data-lucide="folder-plus"></i> 發起工程</button>
+                            </div>
+                        </div>
+                        <div class="mb-10 relative">
+                            <i data-lucide="search" class="absolute left-6 top-1/2 -translate-y-1/2 text-slate-300" size="24"></i>
+                            <input type="text" oninput="App.setSearchTerm(this.value)" value="${this.state.searchTerm}" placeholder="快速搜尋專案名稱或合約編號..." class="w-full pl-16 pr-8 py-6 bg-white border-2 border-slate-50 rounded-[2.5rem] text-xl font-bold shadow-sm focus:border-blue-500 outline-none transition-all">
+                        </div>`;
+                } else if (tab === 'master_library') {
+                    headerHtml = `
+                        <div class="flex justify-between items-start mb-10 gap-8">
+                            <div><h2 class="text-5xl font-black text-slate-900 tracking-tighter mb-3">名稱主檔資料庫</h2>
+                            <span class="text-slate-400 font-bold uppercase text-[10px] tracking-widest font-mono">GLOBAL MASTER HUB</span></div>
+                            ${!this.state.isAddingNew ? `
+                            <div class="flex gap-4">
+                                <button onclick="App.seedMasterLibrary()" class="bg-white border-2 border-slate-200 text-slate-600 px-6 py-3 rounded-2xl font-black hover:bg-slate-50 transition shadow-sm text-sm">載入標準範本</button>
+                                <button onclick="App.startEdit('master', 'new')" class="bg-slate-900 text-white px-8 py-3 rounded-2xl font-black shadow-xl hover:bg-slate-800 transition active:scale-95 flex items-center gap-2"><i data-lucide="plus"></i> 新增標準項目</button>
+                            </div>` : ''}
+                        </div>
+                        ${!this.state.isAddingNew ? `
+                        <div class="mb-10 relative">
+                            <i data-lucide="search" class="absolute left-5 top-1/2 -translate-y-1/2 text-slate-300" size="20"></i>
+                            <input type="text" oninput="App.setSearchTerm(this.value)" value="${this.state.searchTerm}" placeholder="搜尋庫存名稱或型號..." class="w-full pl-14 pr-6 py-4 bg-white border-2 border-slate-50 rounded-[2rem] text-lg font-bold shadow-sm focus:border-blue-500 outline-none transition-all">
+                        </div>` : ''}`;
+                } else if (tab === 'dashboard') {
+                    headerHtml = `
+                        <div class="flex justify-between items-end border-b border-slate-100 pb-8 mb-8">
+                            <div><h2 class="text-4xl font-black text-slate-900 tracking-tighter mb-2 italic underline decoration-blue-500 decoration-8">${this.state.currentProject.name}</h2>
+                            <p class="text-slate-400 font-bold uppercase tracking-widest text-xs font-mono">PROJECT_ID: ${this.state.currentProject.contractNo}</p></div>
+                            <button onclick="App.saveAsProject()" class="bg-white border-2 border-slate-200 text-slate-600 px-5 py-2.5 rounded-2xl text-xs font-black hover:bg-slate-50 flex items-center gap-2 transition-all active:scale-95 shadow-sm"><i data-lucide="copy" size="14"></i> 另存專案副本</button>
+                        </div>`;
+                } else if (tab === 'inventory') {
+                    headerHtml = `
+                        <div class="flex justify-between items-center mb-10">
+                            <div><h2 class="text-4xl font-black text-slate-900 tracking-tighter">合約細項與庫存</h2>
+                            <p class="text-slate-400 font-bold uppercase text-[10px] mt-2 tracking-widest font-mono">CONTRACT SCOPE</p></div>
+                            ${!this.state.isAddingNew ? `
+                            <div class="flex gap-4">
+                                <button onclick="App.openBatchImport()" class="bg-white border-2 border-slate-200 text-blue-600 px-6 py-3 rounded-2xl font-black hover:bg-blue-50 transition shadow-sm flex items-center gap-2 text-sm"><i data-lucide="database" size="18"></i> 批次導入</button>
+                                <button onclick="App.startEdit('material', 'new')" class="bg-slate-900 text-white px-8 py-3 rounded-2xl font-black shadow-xl hover:bg-slate-800 transition flex items-center gap-2 active:scale-95 text-sm"><i data-lucide="plus" size="18"></i> 手動建置</button>
+                            </div>` : ''}
+                        </div>
+                        ${!this.state.isAddingNew ? `
+                        <div class="mb-10 relative">
+                            <i data-lucide="search" class="absolute left-5 top-1/2 -translate-y-1/2 text-slate-300" size="20"></i>
+                            <input type="text" oninput="App.setSearchTerm(this.value)" value="${this.state.searchTerm}" placeholder="篩選合約材料..." class="w-full pl-14 pr-6 py-4 bg-white border-2 border-slate-50 rounded-[2rem] text-lg font-bold shadow-sm focus:border-blue-500 outline-none transition-all">
+                        </div>` : ''}`;
+                } else if (tab === 'logs') {
+                    headerHtml = `
+                        <div class="flex justify-between items-center bg-white p-10 rounded-[3rem] border border-slate-100 shadow-sm mb-10">
+                            <div><h2 class="text-4xl font-black text-slate-900 tracking-tighter mb-1">異動日誌彙整單</h2>
+                            <p class="text-slate-400 font-bold uppercase tracking-widest text-[10px] font-mono">HISTORY LOGS</p></div>
+                            <button onclick="App.exportCSV()" class="bg-slate-900 text-white px-8 py-4 rounded-2xl hover:bg-slate-800 transition shadow-xl active:scale-95 flex items-center gap-2 font-black text-sm"><i data-lucide="download" size="18"></i> 導出 CSV</button>
+                        </div>`;
+                }
+
+                // Content wrapper
+                let contentHtml = '<div id="list-container"></div>';
+
+                main.innerHTML = `<div class="p-8 md:p-16 max-w-7xl mx-auto animate-in fade-in">${headerHtml}${contentHtml}</div>`;
+                this.renderListOnly();
+            },
+
+            // 只更新列表部分以防失去焦點
+            renderListOnly: function() {
+                const container = document.getElementById('list-container');
+                if (!container) return;
+                const tab = this.state.activeTab;
+                const term = this.state.searchTerm.toLowerCase();
+                let html = '';
+
+                if (tab === 'project_select') {
+                    const filtered = this.state.projects.filter(p => (p.name||'').toLowerCase().includes(term) || (p.contractNo||'').toLowerCase().includes(term));
+                    html = `<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+                        ${filtered.map(p => `
+                            <div onclick="App.enterProject('${p.id}')" class="group bg-white p-10 rounded-[3.5rem] border-2 border-transparent hover:border-blue-500 cursor-pointer transition-all shadow-sm hover:shadow-2xl flex flex-col h-[300px]">
+                                <div class="flex justify-between items-start mb-8">
+                                    <div class="w-14 h-14 bg-slate-50 rounded-2xl flex items-center justify-center group-hover:bg-blue-50 transition"><i data-lucide="briefcase" class="text-slate-300 group-hover:text-blue-600" size="24"></i></div>
+                                    <span class="text-[10px] font-black bg-slate-100 text-slate-500 px-3 py-1.5 rounded-xl uppercase tracking-widest font-mono">${p.contractNo}</span>
+                                </div>
+                                <h3 class="text-2xl font-black text-slate-800 mb-3 leading-tight group-hover:text-blue-600 transition line-clamp-2">${p.name}</h3>
+                                <div class="mt-auto pt-6 border-t border-slate-50 flex justify-between items-center text-slate-400 text-[10px] font-black uppercase tracking-widest font-mono">
+                                    <p>Est. ${p.createdAt?.split('T')[0]}</p>
+                                    <button onclick="event.stopPropagation(); App.deleteDoc('projects', '${p.id}', '確定永久刪除此工程及所有紀錄？')" class="text-slate-200 hover:text-red-500 transition p-2 bg-white rounded-full"><i data-lucide="trash-2" size="16"></i></button>
+                                </div>
+                            </div>
+                        `).join('')}
+                        ${filtered.length === 0 ? '<div class="col-span-full py-20 text-center text-slate-300 font-bold italic uppercase tracking-widest text-xl">目前無專案資料，請建立或載入範本。</div>' : ''}
+                    </div>`;
+                } else if (tab === 'master_library') {
+                    const filtered = this.state.masterMaterials.filter(m => (m.name||'').toLowerCase().includes(term) || (m.model||'').toLowerCase().includes(term));
+                    const isEdit = this.state.editingId || this.state.isAddingNew;
+                    const d = this.state.editFormData;
+                    
+                    html = `<div class="bg-white rounded-[3rem] shadow-sm border border-slate-200 overflow-hidden">
+                        <table class="w-full text-left">
+                            <thead class="bg-slate-50 text-slate-400 font-black border-b uppercase tracking-widest text-[10px]">
+                                <tr><th class="px-8 py-6">材料屬性與品名</th><th class="px-8 py-6">預設規格/型號</th><th class="px-8 py-6 text-center">單位</th><th class="px-8 py-6 text-center">管理</th></tr>
+                            </thead>
+                            <tbody class="divide-y divide-slate-100 text-sm font-bold text-slate-700">
+                                ${isEdit ? `
+                                <tr class="bg-blue-50/50">
+                                    <td class="px-6 py-6 space-y-3">
+                                        <input class="w-full p-4 border-2 border-blue-200 rounded-2xl outline-none text-base" placeholder="材料品名" value="${d.name||''}" oninput="App.updateEditForm('name', this.value)">
+                                        <input class="w-full p-3 border border-blue-100 rounded-xl text-xs" placeholder="分類 (如:消防設備)" value="${d.category||''}" oninput="App.updateEditForm('category', this.value)">
+                                    </td>
+                                    <td class="px-6 py-6 space-y-3">
+                                        <input class="w-full p-3 border border-blue-100 rounded-xl" placeholder="型號" value="${d.model||''}" oninput="App.updateEditForm('model', this.value)">
+                                        <input class="w-full p-3 border border-blue-100 rounded-xl" placeholder="規格" value="${d.spec||''}" oninput="App.updateEditForm('spec', this.value)">
+                                    </td>
+                                    <td class="px-6 py-6 text-center"><input class="w-20 mx-auto p-4 border border-blue-100 rounded-2xl text-center" placeholder="單位" value="${d.unit||'具'}" oninput="App.updateEditForm('unit', this.value)"></td>
+                                    <td class="px-6 py-6 text-center">
+                                        <div class="flex justify-center gap-2">
+                                            <button onclick="App.saveMaterial(true)" class="p-3 bg-blue-600 text-white rounded-xl shadow-md"><i data-lucide="check" size="18"></i></button>
+                                            <button onclick="App.cancelEdit()" class="p-3 bg-white text-slate-400 rounded-xl border hover:bg-slate-50"><i data-lucide="x" size="18"></i></button>
+                                        </div>
+                                    </td>
+                                </tr>` : ''}
+                                ${filtered.map(m => `
+                                <tr class="hover:bg-slate-50 transition-all group">
+                                    <td class="px-8 py-6"><div class="text-base text-slate-900">${m.name}</div><span class="text-[9px] bg-slate-100 text-slate-400 px-2 py-0.5 rounded uppercase tracking-widest mt-1 inline-block">${m.category||'一般'}</span></td>
+                                    <td class="px-8 py-6"><div class="font-black text-slate-600 uppercase tracking-tight text-xs font-mono">${m.model || '--'}</div><div class="text-[10px] text-slate-400 mt-1">${m.spec || ''}</div></td>
+                                    <td class="px-8 py-6 text-center text-slate-400 uppercase">${m.unit}</td>
+                                    <td class="px-8 py-6 text-center">
+                                        <div class="flex justify-center gap-3 opacity-0 group-hover:opacity-100 transition-all">
+                                            <button onclick="App.startEdit('master', '${m.id}', ${JSON.stringify(m).replace(/"/g, '&quot;')})" class="text-slate-300 hover:text-blue-600"><i data-lucide="edit-2" size="18"></i></button>
+                                            <button onclick="App.deleteDoc('master_materials', '${m.id}', '確定移除此主檔？')" class="text-slate-300 hover:text-red-500"><i data-lucide="trash-2" size="18"></i></button>
+                                        </div>
+                                    </td>
+                                </tr>`).join('')}
+                            </tbody>
+                        </table>
+                    </div>`;
+                } else if (tab === 'dashboard') {
+                    const proc = this.getProcessedMaterials();
+                    const overCount = proc.filter(m => m.isOver).length;
+                    const avgProgress = proc.length ? Math.round(proc.reduce((s, m) => s + m.progress, 0) / proc.length) : 0;
+                    
+                    html = `
+                    <div class="grid grid-cols-1 md:grid-cols-4 gap-8 mb-12">
+                        ${[{ l: '合約總項', v: proc.length, c: 'text-slate-800', i: 'layout-grid' },
+                           { l: '庫存不足/警示', v: proc.filter(m=>m.isLow || m.isEmpty).length, c: 'text-amber-600', i: 'shopping-cart' },
+                           { l: '超領警告', v: overCount, c: 'text-red-600', i: 'alert-triangle' },
+                           { l: '專案執行率', v: avgProgress + '%', c: 'text-blue-600', i: 'trending-up' }
+                        ].map(s => `
+                            <div class="bg-white p-8 rounded-[3rem] shadow-sm border border-slate-50 flex flex-col justify-between h-40">
+                                <div class="flex justify-between items-start"><p class="text-slate-400 text-[10px] font-black uppercase tracking-widest">${s.l}</p><i data-lucide="${s.i}" class="${s.c}" size="20"></i></div>
+                                <p class="text-4xl font-black ${s.c} tracking-tight">${s.v}</p>
+                            </div>
+                        `).join('')}
+                    </div>
+                    <div class="bg-white p-12 rounded-[4rem] shadow-sm border border-slate-50">
+                        <h3 class="text-2xl font-black text-slate-800 mb-8 flex items-center gap-4"><div class="w-2 h-6 bg-blue-600 rounded-full"></div> 領料進度排行 (Top 6)</h3>
+                        <div class="space-y-8">
+                            ${[...proc].sort((a,b) => b.progress - a.progress).slice(0, 6).map(m => `
+                                <div class="space-y-3">
+                                    <div class="flex justify-between items-end font-black text-sm tracking-tight">
+                                        <span class="text-slate-800">${m.name}</span>
+                                        <span class="${m.isOver ? 'text-red-600' : 'text-slate-400'} font-mono">${m.totalOut} / ${m.contractQty} ${m.unit}</span>
+                                    </div>
+                                    <div class="w-full h-3 bg-slate-100 rounded-full overflow-hidden shadow-inner flex">
+                                        <div class="h-full ${m.isOver ? 'bg-red-500' : 'bg-blue-600'} transition-all duration-1000 rounded-full" style="width: ${m.progress}%"></div>
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>`;
+                } else if (tab === 'inventory') {
+                    const proc = this.getProcessedMaterials().filter(m => (m.name||'').toLowerCase().includes(term) || (m.category||'').toLowerCase().includes(term));
+                    const isEdit = this.state.editingId || this.state.isAddingNew;
+                    const d = this.state.editFormData;
+
+                    html = `<div class="bg-white rounded-[3rem] shadow-sm border border-slate-200 overflow-hidden">
+                        <table class="w-full text-left">
+                            <thead class="bg-slate-50 text-slate-400 font-black border-b uppercase tracking-widest text-[9px]">
+                                <tr><th class="px-8 py-6">合約項目</th><th class="px-8 py-6">型號/規格</th><th class="px-8 py-6 text-center">合約量</th><th class="px-8 py-6 text-center">出/入</th><th class="px-8 py-6 text-center">庫存</th><th class="px-8 py-6 text-center">管理</th></tr>
+                            </thead>
+                            <tbody class="divide-y divide-slate-100 text-sm font-bold text-slate-700">
+                                ${isEdit ? `
+                                <tr class="bg-blue-50/50">
+                                    <td class="px-6 py-6 space-y-3">
+                                        <input class="w-full p-4 border-2 border-blue-200 rounded-2xl outline-none text-base" placeholder="材料品名" value="${d.name||''}" oninput="App.updateEditForm('name', this.value)">
+                                        <input class="w-full p-3 border border-blue-100 rounded-xl text-xs" placeholder="分類 (如:消防設備)" value="${d.category||''}" oninput="App.updateEditForm('category', this.value)">
+                                    </td>
+                                    <td class="px-6 py-6 space-y-3">
+                                        <input class="w-full p-3 border border-blue-100 rounded-xl" placeholder="型號" value="${d.model||''}" oninput="App.updateEditForm('model', this.value)">
+                                        <input class="w-full p-3 border border-blue-100 rounded-xl" placeholder="規格" value="${d.spec||''}" oninput="App.updateEditForm('spec', this.value)">
+                                    </td>
+                                    <td class="px-6 py-6 text-center space-y-2">
+                                        <input type="number" class="w-20 mx-auto p-3 border border-blue-100 rounded-xl text-center" placeholder="合約量" value="${d.contractQty||0}" oninput="App.updateEditForm('contractQty', this.value)">
+                                        <input class="w-20 mx-auto p-3 border border-blue-100 rounded-xl text-center" placeholder="單位" value="${d.unit||'具'}" oninput="App.updateEditForm('unit', this.value)">
+                                    </td>
+                                    <td class="px-6 py-6 text-center" colspan="2">
+                                        <input type="number" class="w-24 mx-auto p-3 border border-amber-200 rounded-xl text-center text-xs" placeholder="安全存量" value="${d.safetyStock||0}" title="安全庫存量" oninput="App.updateEditForm('safetyStock', this.value)">
+                                    </td>
+                                    <td class="px-6 py-6 text-center">
+                                        <div class="flex justify-center gap-2">
+                                            <button onclick="App.saveMaterial(false)" class="p-3 bg-blue-600 text-white rounded-xl shadow-md"><i data-lucide="check" size="18"></i></button>
+                                            <button onclick="App.cancelEdit()" class="p-3 bg-white text-slate-400 rounded-xl border hover:bg-slate-50"><i data-lucide="x" size="18"></i></button>
+                                        </div>
+                                    </td>
+                                </tr>` : ''}
+                                ${proc.map(m => `
+                                <tr class="hover:bg-slate-50 transition-all group border-l-4 border-transparent hover:border-blue-500">
+                                    <td class="px-8 py-6"><div class="text-base text-slate-900">${m.name}</div><span class="text-[9px] bg-slate-100 text-slate-400 px-2 py-0.5 rounded uppercase tracking-widest mt-1 inline-block">${m.category||'一般'}</span></td>
+                                    <td class="px-8 py-6"><div class="font-black text-slate-600 uppercase tracking-tight text-xs font-mono">${m.model || '--'}</div><div class="text-[10px] text-slate-400 mt-1">${m.spec || ''}</div></td>
+                                    <td class="px-8 py-6 text-center"><span class="text-xl font-black font-mono tracking-tighter">${m.contractQty}</span> <span class="text-[9px] text-slate-400 uppercase">${m.unit}</span></td>
+                                    <td class="px-8 py-6 text-center">
+                                        <div class="flex flex-col items-center gap-1">
+                                            <span class="text-[9px] font-black text-green-600 bg-green-50 px-2 py-0.5 rounded">入: ${m.totalIn}</span>
+                                            <span class="text-[9px] font-black ${m.isOver?'bg-red-50 text-red-600':'text-orange-600 bg-orange-50'} px-2 py-0.5 rounded">出: ${m.totalOut}</span>
+                                        </div>
+                                    </td>
+                                    <td class="px-8 py-6 text-center">
+                                        <div class="inline-block min-w-[60px] px-3 py-1.5 rounded-xl font-black text-lg tracking-tighter border font-mono ${m.isEmpty ? 'bg-red-50 text-red-600 border-red-100' : m.isLow ? 'bg-amber-50 text-amber-600 border-amber-100' : 'bg-slate-50 text-slate-700 border-slate-200'}">${m.stock}</div>
+                                    </td>
+                                    <td class="px-8 py-6 text-center">
+                                        <div class="flex justify-center gap-3 opacity-0 group-hover:opacity-100 transition-all">
+                                            <button onclick="App.startEdit('material', '${m.id}', ${JSON.stringify(m).replace(/"/g, '&quot;')})" class="text-slate-300 hover:text-blue-600"><i data-lucide="edit-2" size="18"></i></button>
+                                            <button onclick="App.deleteDoc('materials', '${m.id}', '確定從合約移除此項？')" class="text-slate-300 hover:text-red-500"><i data-lucide="trash-2" size="18"></i></button>
+                                        </div>
+                                    </td>
+                                </tr>`).join('')}
+                            </tbody>
+                        </table>
+                    </div>`;
+                } else if (tab === 'form') {
+                    const proc = this.getProcessedMaterials();
+                    html = `
+                    <div class="max-w-4xl mx-auto bg-white p-16 rounded-[4.5rem] shadow-2xl border border-slate-50">
+                        <h3 class="text-4xl font-black text-slate-900 mb-8 tracking-tighter italic">異動登錄申請</h3>
+                        <form id="log-form" onsubmit="App.submitLog(event)" class="space-y-12">
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-10">
+                                <div class="space-y-4">
+                                    <label class="text-[11px] font-black text-slate-400 uppercase tracking-widest ml-1">操作日期</label>
+                                    <input id="f-date" type="date" value="${this.state.formDate}" class="w-full p-5 bg-slate-50 border-2 border-transparent rounded-3xl font-black outline-none focus:bg-white focus:border-blue-500 font-mono text-lg">
+                                </div>
+                                <div class="space-y-4">
+                                    <label class="text-[11px] font-black text-slate-400 uppercase tracking-widest ml-1">進出屬性</label>
+                                    <select id="f-type" onchange="App.handleFormInput()" class="w-full p-5 bg-slate-50 border-2 border-transparent rounded-3xl font-black outline-none focus:bg-white focus:border-blue-500 text-lg appearance-none">
+                                        <option value="出貨">工地領料 (出庫)</option>
+                                        <option value="進貨">廠商到貨 (入庫)</option>
+                                    </select>
+                                </div>
+                                <div class="md:col-span-2 space-y-4">
+                                    <label class="text-[11px] font-black text-slate-400 uppercase tracking-widest ml-1">選擇合約材料項</label>
+                                    <select id="f-mat" onchange="App.handleFormInput()" class="w-full p-6 bg-slate-50 border-2 border-transparent rounded-3xl font-black outline-none focus:bg-white focus:border-blue-500 text-xl appearance-none" required>
+                                        <option value="">-- 由合約清單中選取 --</option>
+                                        ${proc.map(m => `<option value="${m.id}">${m.name} | M: ${m.model || '--'} (庫存:${m.stock})</option>`).join('')}
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-10">
+                                <div class="space-y-4">
+                                    <label class="text-[11px] font-black text-slate-400 uppercase tracking-widest ml-1">本次異動數量</label>
+                                    <input id="f-qty" type="number" step="0.01" oninput="App.handleFormInput()" placeholder="0.00" class="w-full p-6 bg-slate-50 border-2 border-transparent rounded-3xl font-black outline-none focus:bg-white focus:border-blue-500 text-4xl font-mono text-blue-600" required>
+                                </div>
+                                <div class="space-y-4">
+                                    <label class="text-[11px] font-black text-slate-400 uppercase tracking-widest ml-1">簽單用途備註</label>
+                                    <input id="f-note" type="text" placeholder="如：2F 配管施工" class="w-full p-6 bg-slate-50 border-2 border-transparent rounded-3xl font-bold outline-none focus:bg-white focus:border-blue-500 text-lg">
+                                </div>
+                            </div>
+                            <!-- 動態超量警告區 -->
+                            <div id="overload-warning" class="bg-red-50 p-10 rounded-[3rem] border border-red-100 hidden space-y-4 animate-in zoom-in">
+                                <div class="flex items-center gap-3 text-red-600 font-black text-lg uppercase tracking-widest italic"><i data-lucide="alert-triangle" size="24"></i> 領料將超過合約上限</div>
+                                <textarea id="f-reason" rows="2" placeholder="請詳細填寫超領申請原因 (必填)..." class="w-full p-5 rounded-2xl border border-red-200 outline-none text-sm font-bold shadow-sm"></textarea>
+                            </div>
+                            <div class="flex justify-end pt-6 border-t border-slate-50">
+                                <button type="submit" class="w-full md:w-auto px-20 py-6 bg-blue-600 text-white rounded-[2.5rem] font-black text-xl shadow-2xl hover:bg-blue-700 hover:scale-[1.02] active:scale-95 transition-all tracking-widest uppercase italic">Sync Record</button>
+                            </div>
+                        </form>
+                    </div>`;
+                } else if (tab === 'logs') {
+                    html = `<div class="bg-white rounded-[4rem] shadow-sm border border-slate-100 overflow-hidden">
+                        <table class="w-full text-left font-bold text-sm">
+                            <thead class="bg-slate-50 text-slate-400 uppercase text-[10px] font-black tracking-widest border-b font-mono">
+                                <tr><th class="p-8">日期</th><th class="p-8">類型</th><th class="p-8">品項資訊</th><th class="p-8 text-right">數量</th><th class="p-8 text-center">操作員</th><th class="p-8">備註</th></tr>
+                            </thead>
+                            <tbody class="divide-y divide-slate-100 text-slate-700">
+                                ${this.state.logs.map(l => {
+                                    const m = this.state.materials.find(mat => String(mat.id) === String(l.materialId));
+                                    return `
+                                        <tr class="hover:bg-slate-50 transition-all border-l-8 border-transparent hover:border-blue-500">
+                                            <td class="p-8 font-mono text-xs text-slate-400 italic">${l.date}</td>
+                                            <td class="p-8"><span class="px-4 py-1.5 rounded-xl text-[9px] font-black uppercase ${l.type === '進貨' ? 'bg-green-100 text-green-700' : 'bg-orange-100 text-orange-700'}">${l.type}</span></td>
+                                            <td class="p-8 font-black text-slate-800 text-lg tracking-tight">${m?.name || "已刪除項目"}</td>
+                                            <td class="p-8 text-right font-black text-2xl font-mono tracking-tighter">${l.type === '進貨' ? '+' : '-'}${l.qty}</td>
+                                            <td class="p-8 font-mono text-[9px] text-slate-400 text-center uppercase bg-slate-50 rounded-lg p-2">${l.user.slice(-6)}</td>
+                                            <td class="p-8 text-slate-400 text-xs font-bold italic line-clamp-1 max-w-xs">${l.note || "-"}</td>
+                                        </tr>`;
+                                }).join('')}
+                            </tbody>
+                        </table>
+                    </div>`;
+                }
+
+                container.innerHTML = html;
+                lucide.createIcons();
+            },
+
+            // --- 渲染批次導入清單 ---
+            renderImportList: function() {
+                const listHtml = this.state.masterMaterials.map(m => {
+                    const isSel = this.state.selectedImportIds.includes(m.id);
+                    return `<div onclick="App.toggleImportItem('${m.id}', this)" class="p-6 bg-slate-50 hover:bg-blue-50 rounded-[2rem] cursor-pointer mb-3 flex justify-between items-center transition-all border-2 border-transparent hover:border-blue-200 group">
+                       <div class="flex items-center gap-4">
+                          <div class="select-box w-7 h-7 rounded-xl border-2 flex items-center justify-center transition-all ${isSel ? 'bg-blue-600 border-blue-600' : 'bg-white border-slate-300'}">
+                             ${isSel ? '<i data-lucide="check" class="text-white" size="16"></i>' : ''}
+                          </div>
+                          <div><p class="font-black text-xl text-slate-800 tracking-tighter">${m.name}</p><p class="text-xs text-slate-400 font-bold uppercase mt-1 tracking-widest font-mono">SPEC: ${m.model || '--'}</p></div>
+                       </div>
+                       <span class="text-[10px] font-black bg-slate-200 px-3 py-1 rounded-full text-slate-500 font-mono italic uppercase">${m.unit}</span>
+                    </div>`;
+                }).join('');
+                const container = document.getElementById('import-list-container');
+                if(container) container.innerHTML = listHtml || '<p class="text-center py-20 text-slate-300 font-black text-xl italic uppercase tracking-tighter">名稱主檔為空</p>';
+                lucide.createIcons();
+            }
+        };
+
+        // 綁定全域變數，供 HTML inline event 呼叫
+        window.App = App;
+        window.onload = () => App.init();
+
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;700;900&display=swap');
+        body { font-family: 'Noto Sans TC', sans-serif; overflow: hidden; }
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 10px; }
+        .animate-in { animation: fadeIn 0.4s ease-out; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .zoom-in { animation: zoomIn 0.3s cubic-bezier(0.34, 1.56, 0.64, 1); }
+        @keyframes zoomIn { from { transform: scale(0.95); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+    </style>
+</head>
+<body class="bg-[#f8fafc]">
+    <div class="flex flex-col md:flex-row h-screen overflow-hidden font-black text-slate-900">
+        <!-- Sidebar Navigation -->
+        <nav class="w-full md:w-80 bg-[#0f172a] text-white p-10 flex flex-col shrink-0 shadow-2xl z-20 font-black">
+            <div class="mb-12 text-center">
+                <h1 class="text-4xl font-black text-blue-400 tracking-tighter italic text-center uppercase">Material Hub</h1>
+                <p class="text-slate-500 text-[10px] font-bold uppercase tracking-[0.3em] mt-2 border-b border-slate-800 pb-4 leading-relaxed font-mono">WU CHI CHUNG<br>PRO MASTER V22-FINAL</p>
+            </div>
+
+            <div class="space-y-1 flex-1">
+                <button id="nav-project_select" onclick="App.switchTab('project_select')" class="nav-btn w-full flex items-center gap-4 px-6 py-4 rounded-2xl transition font-black bg-blue-600 text-white shadow-xl italic tracking-widest text-sm uppercase">
+                    <i data-lucide="briefcase" size="18"></i> 開案中心
+                </button>
+                <button id="nav-master_library" onclick="App.switchTab('master_library')" class="nav-btn w-full flex items-center gap-4 px-6 py-4 rounded-2xl transition font-black text-slate-400 hover:bg-slate-800 italic tracking-widest text-sm uppercase font-mono">
+                    <i data-lucide="database" size="18"></i> 名稱庫
+                </button>
+
+                <div id="sidebar-project-info" class="pt-10 mt-10 border-t border-slate-800 hidden animate-in">
+                    <p id="sidebar-project-name" class="px-6 text-[11px] font-black text-blue-500 uppercase tracking-widest truncate mb-6 font-mono underline decoration-2 underline-offset-8 decoration-blue-500/30 italic">CURRENT_PROJECT</p>
+                    <div id="project-nav-group" class="space-y-1 font-mono">
+                        <button id="nav-dashboard" onclick="App.switchTab('dashboard')" class="nav-btn w-full flex items-center gap-4 px-6 py-3.5 rounded-xl hover:bg-slate-800 text-slate-400 text-xs font-black transition-all italic">
+                            <i data-lucide="layout-dashboard" size="14"></i> 營運分析
+                        </button>
+                        <button id="nav-inventory" onclick="App.switchTab('inventory')" class="nav-btn w-full flex items-center gap-4 px-6 py-3.5 rounded-xl hover:bg-slate-800 text-slate-400 text-xs font-black transition-all italic">
+                            <i data-lucide="package" size="14"></i> 合約細項
+                        </button>
+                        <button id="nav-form" onclick="App.switchTab('form')" class="nav-btn w-full flex items-center gap-4 px-6 py-3.5 rounded-xl hover:bg-slate-800 text-slate-400 text-xs font-black transition-all italic">
+                            <i data-lucide="plus-circle" size="14"></i> 異動登錄
+                        </button>
+                        <button id="nav-logs" onclick="App.switchTab('logs')" class="nav-btn w-full flex items-center gap-4 px-6 py-3.5 rounded-xl hover:bg-slate-800 text-slate-400 text-xs font-black transition-all italic">
+                            <i data-lucide="history" size="14"></i> 異動日誌
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="mt-auto pt-8 border-t border-slate-800 space-y-5">
+                <div class="flex items-center gap-4">
+                    <div class="w-12 h-12 rounded-2xl bg-blue-600/20 flex items-center justify-center border border-blue-500/30 text-blue-400 font-black shadow-inner font-mono text-xl">
+                        <span id="user-initial">?</span>
+                    </div>
+                    <div>
+                        <p class="text-[10px] text-slate-500 font-black uppercase tracking-widest font-mono italic">SYSTEM: WU CHI CHUNG</p>
+                        <p class="text-sm font-black text-slate-200 font-mono tracking-tighter italic">在線人數：<span id="global-count">0</span> 人</p>
+                        <p class="text-[9px] text-slate-600 font-mono tracking-tighter mt-1 uppercase italic">UID: <span id="user-id">------</span></p>
+                    </div>
+                </div>
+            </div>
+        </nav>
+
+        <!-- Main Content Area -->
+        <main id="main-area" class="flex-1 overflow-y-auto custom-scrollbar relative bg-[#f8fafc]">
+            <div class="h-full flex items-center justify-center animate-pulse">
+                <div class="flex flex-col items-center gap-4">
+                    <i data-lucide="refresh-cw" class="text-blue-500 animate-spin" size="32"></i>
+                    <p class="text-slate-400 font-bold uppercase tracking-widest text-xs italic font-black">連接雲端伺服器中...</p>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Modal: 發起新工程 -->
+    <div id="modal-create-project" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[100] flex items-center justify-center p-6 hidden">
+        <div class="bg-white w-full max-w-2xl p-16 rounded-[4.5rem] shadow-2xl border-t-8 border-blue-600 animate-in zoom-in">
+            <h2 class="text-5xl font-black text-slate-900 mb-2 tracking-tighter italic text-center uppercase tracking-widest">Init Project</h2>
+            <p class="text-slate-400 text-[10px] font-black uppercase tracking-widest mb-12 italic underline decoration-blue-500 decoration-4 text-center font-mono">DEVELOPER: WU CHI CHUNG</p>
+            <div class="space-y-8">
+                <div class="space-y-3">
+                    <label class="text-[11px] font-black text-slate-400 uppercase tracking-widest ml-1 font-mono italic">Project Chinese Name</label>
+                    <input id="new-proj-name" type="text" placeholder="例如：高雄三井工程材料管制" class="w-full p-6 bg-slate-50 border-2 border-transparent rounded-3xl font-black text-xl outline-none focus:bg-white focus:border-blue-500 transition shadow-inner italic">
+                </div>
+                <div class="space-y-3">
+                    <label class="text-[11px] font-black text-slate-400 uppercase tracking-widest ml-1 font-mono italic">CONTRACT_ID_NO</label>
+                    <input id="new-proj-no" type="text" placeholder="如 CON-2026-YT01" class="w-full p-6 bg-slate-50 border-2 border-transparent rounded-3xl font-mono font-black text-xl outline-none focus:bg-white focus:border-blue-500 transition shadow-inner tracking-widest italic text-blue-600">
+                </div>
+                <div class="flex gap-4 pt-4">
+                    <button onclick="App.closeCreateModal()" class="flex-1 py-7 font-black text-slate-400 hover:text-slate-800 transition tracking-widest uppercase font-mono">CANCEL</button>
+                    <button onclick="App.createProject()" class="flex-1 bg-blue-600 text-white py-7 rounded-[2.5rem] font-black shadow-2xl hover:bg-blue-700 active:scale-95 transition-all text-xl uppercase tracking-tighter font-mono italic">Establish</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal: 批次導入 -->
+    <div id="modal-import" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[100] flex items-center justify-center p-6 hidden">
+        <div class="bg-white w-full max-w-2xl p-12 rounded-[4rem] shadow-2xl flex flex-col max-h-[85vh] animate-in zoom-in border-t-8 border-blue-600">
+            <div class="flex justify-between items-center mb-8">
+                <div>
+                    <h3 class="text-4xl font-black tracking-tighter italic font-mono uppercase">Batch Import</h3>
+                    <p class="text-slate-400 font-bold text-[10px] mt-2 uppercase tracking-widest font-mono">Select Items from Master DB</p>
+                </div>
+                <button onclick="document.getElementById('modal-import').classList.add('hidden')" class="p-2 hover:bg-slate-100 rounded-full transition"><i data-lucide="x"></i></button>
+            </div>
+            <div id="import-list-container" class="overflow-y-auto pr-2 custom-scrollbar flex-1">
+                <!-- Javascript will populate this -->
+            </div>
+            <div class="mt-8 flex gap-4 pt-6 border-t border-slate-50">
+                <button onclick="App.executeBatchImport()" class="flex-1 bg-blue-600 text-white py-6 rounded-[2.5rem] font-black text-xl shadow-2xl hover:bg-blue-700 transition active:scale-95 italic tracking-widest uppercase font-mono">Confirm Import</button>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
